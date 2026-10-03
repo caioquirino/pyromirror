@@ -43,6 +43,9 @@ pyromirror_capture_context* pyromirror_capture_create(const pyromirror_capture_c
 // Releases any previously acquired frame, then waits up to timeout_ms for a new one.
 int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint32_t timeout_ms, pyromirror_capture_frame* out_frame);
 void pyromirror_capture_release(pyromirror_capture_context* ctx);
+// Windows: position and size of the captured monitor in virtual-desktop pixels. Returns false
+// where that is not known (Linux).
+bool pyromirror_capture_get_bounds(pyromirror_capture_context* ctx, int32_t* x, int32_t* y, uint32_t* width, uint32_t* height);
 // True if the captured monitor is in HDR mode. Frames are still 8-bit SDR in that case, converted
 // by the OS, which typically looks washed out.
 bool pyromirror_capture_hdr_active(pyromirror_capture_context* ctx);

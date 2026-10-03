@@ -6,8 +6,12 @@
 //! Both backends currently deliver CPU-readable 32-bit frames. Handing the GPU texture straight
 //! to the encoder (D3D11 shared handle / DMA-BUF) is future work.
 
+mod input;
+mod keymap;
 #[cfg(target_os = "linux")]
 mod portal;
+
+pub use input::InputInjector;
 
 use std::ffi::CStr;
 use std::os::raw::c_char;
@@ -77,6 +81,8 @@ extern "C" {
     fn pyromirror_capture_create(config: *const RawConfig, error: *mut c_char, error_size: u32) -> *mut RawContext;
     fn pyromirror_capture_acquire(ctx: *mut RawContext, timeout_ms: u32, out_frame: *mut RawFrame) -> i32;
     fn pyromirror_capture_release(ctx: *mut RawContext);
+    #[cfg_attr(not(windows), allow(dead_code))]
+    fn pyromirror_capture_get_bounds(ctx: *mut RawContext, x: *mut i32, y: *mut i32, width: *mut u32, height: *mut u32) -> bool;
     fn pyromirror_capture_hdr_active(ctx: *mut RawContext) -> bool;
     fn pyromirror_capture_last_error(ctx: *mut RawContext) -> *const c_char;
     fn pyromirror_capture_destroy(ctx: *mut RawContext);
@@ -90,6 +96,17 @@ pub struct Capturer {
 
 // The native context is only used through `&mut self` and has no thread affinity.
 unsafe impl Send for Capturer {}
+
+/// Makes this process see real pixels on scaled (high-DPI) displays, so that monitor bounds and
+/// pointer coordinates agree with the captured image. Call once, before anything else. No-op
+/// outside Windows.
+pub fn init_process() {
+    #[cfg(windows)]
+    unsafe {
+        use windows_sys::Win32::UI::HiDpi::*;
+        SetProcessDpiAwarenessContext(DPI_AWARENESS_CONTEXT_PER_MONITOR_AWARE_V2);
+    }
+}
 
 impl Capturer {
     /// Starts capturing. On Linux this may block on a permission dialog shown by the desktop.
@@ -130,6 +147,25 @@ impl Capturer {
             #[cfg(target_os = "linux")]
             _portal: portal_session,
         })
+    }
+
+    /// Something to feed the client's mouse and keyboard into, if this desktop allows it.
+    pub fn input_injector(&self) -> Option<InputInjector> {
+        #[cfg(target_os = "linux")]
+        {
+            match &self._portal {
+                portal::PortalSession::Remote(remote) => {
+                    Some(InputInjector::new(input::Backend { remote: remote.clone() }))
+                }
+                portal::PortalSession::ViewOnly(_) => None,
+            }
+        }
+        #[cfg(windows)]
+        {
+            let (mut x, mut y, mut width, mut height) = (0i32, 0i32, 0u32, 0u32);
+            unsafe { pyromirror_capture_get_bounds(self.ctx, &mut x, &mut y, &mut width, &mut height) }
+                .then(|| InputInjector::new(input::Backend { x, y, width, height }))
+        }
     }
 
     /// Waits up to `timeout` for the desktop to change. `Ok(None)` means nothing was redrawn,

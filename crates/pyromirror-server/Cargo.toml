@@ -9,6 +9,8 @@ pyromirror-proto = { path = "../pyromirror-proto" }
 pyromirror-net = { path = "../pyromirror-net" }
 pyromirror-codec = { path = "../pyromirror-codec" }
 pyromirror-capture = { path = "../pyromirror-capture" }
+pyromirror-audio = { path = "../pyromirror-audio" }
+crossbeam-channel = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }

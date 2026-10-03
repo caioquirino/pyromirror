@@ -192,24 +192,93 @@ pub struct VideoPacket<'a> {
     pub payload: &'a [u8],
 }
 
-/// Parses a datagram produced by [`FrameSender`]. Non-video datagrams are rejected.
-pub fn parse_video_datagram(data: &[u8]) -> Result<VideoPacket<'_>, NetError> {
+/// One received audio datagram: interleaved little-endian 16-bit PCM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AudioPacket<'a> {
+    /// Wrapping packet counter, ordered like video frames (see [`frame_seq_is_newer`]).
+    pub seq: u32,
+    pub pts: u64,
+    pub payload: &'a [u8],
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Packet<'a> {
+    Video(VideoPacket<'a>),
+    Audio(AudioPacket<'a>),
+}
+
+/// Parses a datagram produced by [`FrameSender`] or [`AudioSender`].
+pub fn parse_datagram(data: &[u8]) -> Result<Packet<'_>, NetError> {
     if data.len() < PAYLOAD_HEADER_SIZE {
         return Err(NetError::MalformedPacket);
     }
     let header = PayloadHeader::deserialize(&data[..PAYLOAD_HEADER_SIZE])?;
     let payload = &data[PAYLOAD_HEADER_SIZE..];
-    if header.payload_size as usize != payload.len() || header.flags & PAYLOAD_STREAM_TYPE_BIT != 0 {
+    if header.payload_size as usize != payload.len() {
         return Err(NetError::MalformedPacket);
     }
-    Ok(VideoPacket {
-        frame_seq: header.packet_seq(),
-        index: header.subpacket_seq(),
-        pts: header.pts,
-        first: header.is_packet_begin(),
-        last: header.is_packet_end(),
-        payload,
+    Ok(if header.is_audio() {
+        Packet::Audio(AudioPacket { seq: header.packet_seq(), pts: header.pts, payload })
+    } else {
+        Packet::Video(VideoPacket {
+            frame_seq: header.packet_seq(),
+            index: header.subpacket_seq(),
+            pts: header.pts,
+            first: header.is_packet_begin(),
+            last: header.is_packet_end(),
+            payload,
+        })
     })
+}
+
+/// Like [`parse_datagram`], but rejects anything that is not video.
+pub fn parse_video_datagram(data: &[u8]) -> Result<VideoPacket<'_>, NetError> {
+    match parse_datagram(data)? {
+        Packet::Video(packet) => Ok(packet),
+        Packet::Audio(_) => Err(NetError::MalformedPacket),
+    }
+}
+
+/// Sends raw PCM audio. Audio is tiny next to video, so it is neither paced nor compressed.
+pub struct AudioSender {
+    socket: std::net::UdpSocket,
+    target_addr: SocketAddr,
+    seq: u32,
+    max_samples: usize,
+    packet_buf: Vec<u8>,
+}
+
+impl AudioSender {
+    /// `mtu` is the largest datagram to produce, `channels` keeps frames whole within a packet.
+    pub fn new(socket: std::net::UdpSocket, target_addr: SocketAddr, mtu: usize, channels: usize) -> Self {
+        let channels = channels.max(1);
+        let max_samples = (packet_boundary(mtu) / 2 / channels).max(1) * channels;
+        Self { socket, target_addr, seq: 0, max_samples, packet_buf: Vec::new() }
+    }
+
+    pub fn set_target_addr(&mut self, target: SocketAddr) {
+        self.target_addr = target;
+    }
+
+    pub fn send(&mut self, samples: &[i16], pts: u64) -> Result<(), NetError> {
+        for chunk in samples.chunks(self.max_samples) {
+            let header = PayloadHeader {
+                pts,
+                dts_delta: 0,
+                payload_size: (chunk.len() * 2) as u32,
+                num_fec_blocks: 0,
+                num_xor_blocks_even: 0,
+                num_xor_blocks_odd: 0,
+                flags: PAYLOAD_STREAM_TYPE_BIT | (self.seq << PAYLOAD_PACKET_SEQ_OFFSET),
+            };
+            self.packet_buf.resize(PAYLOAD_HEADER_SIZE, 0);
+            header.serialize(&mut self.packet_buf)?;
+            self.packet_buf.extend(chunk.iter().flat_map(|s| s.to_le_bytes()));
+            self.socket.send_to(&self.packet_buf, self.target_addr)?;
+            self.seq = (self.seq + 1) & PAYLOAD_PACKET_SEQ_MASK;
+        }
+        Ok(())
+    }
 }
 
 /// Whether frame `a` comes after frame `b`, accounting for wrap-around of the frame counter.
@@ -238,6 +307,30 @@ mod tests {
         assert!(!frame_seq_is_newer(5, 5));
         assert!(frame_seq_is_newer(0, PAYLOAD_PACKET_SEQ_MASK));
         assert!(!frame_seq_is_newer(PAYLOAD_PACKET_SEQ_MASK, 0));
+    }
+
+    #[test]
+    fn audio_is_chunked_on_frame_boundaries() {
+        let rx = create_streaming_socket("127.0.0.1:0".parse().unwrap(), 1 << 20).unwrap();
+        let tx = create_streaming_socket("127.0.0.1:0".parse().unwrap(), 1 << 20).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        // 64-byte datagrams leave room for 20 samples = 10 stereo frames.
+        let mut sender = AudioSender::new(tx, rx.local_addr().unwrap(), 64, 2);
+        let samples: Vec<i16> = (0..50).map(|i| i * 300 - 7000).collect();
+        sender.send(&samples, 42).unwrap();
+
+        let mut received = Vec::new();
+        let mut buf = [0u8; 128];
+        for expected_seq in 0..3 {
+            let (len, _) = rx.recv_from(&mut buf).unwrap();
+            assert!(len <= 64);
+            assert!(parse_video_datagram(&buf[..len]).is_err());
+            let Packet::Audio(packet) = parse_datagram(&buf[..len]).unwrap() else { panic!("not audio") };
+            assert_eq!((packet.seq, packet.pts), (expected_seq, 42));
+            assert_eq!(packet.payload.len() % 4, 0);
+            received.extend(packet.payload.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
+        }
+        assert_eq!(received, samples);
     }
 
     #[test]

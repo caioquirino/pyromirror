@@ -1,24 +1,46 @@
-//! xdg-desktop-portal ScreenCast session.
+//! xdg-desktop-portal session: ScreenCast for the picture, RemoteDesktop for input.
 //!
-//! This is the only capture route that works across Wayland compositors (GNOME, KDE, wlroots via
-//! xdg-desktop-portal-wlr, ...) and it also covers X11 sessions on those desktops. The portal
-//! shows the user a monitor picker; the choice is remembered through a restore token so the
-//! dialog only appears on first use.
+//! This is the only route that works across Wayland compositors (GNOME, KDE, ...) and it also
+//! covers X11 sessions on those desktops. The portal shows the user a permission dialog; the
+//! choice is remembered through a restore token so the dialog only appears on first use.
+//!
+//! Desktops whose portal has no RemoteDesktop interface (wlroots) get a view-only ScreenCast
+//! session.
 
 use std::os::fd::{IntoRawFd, RawFd};
 use std::path::PathBuf;
+use std::sync::Arc;
 
-use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType};
+use ashpd::desktop::remote_desktop::{DeviceType, RemoteDesktop, SelectDevicesOptions};
+use ashpd::desktop::screencast::{CursorMode, Screencast, SelectSourcesOptions, SourceType, Stream};
 use ashpd::desktop::{PersistMode, Session};
+use ashpd::enumflags2::BitFlags;
 
 use crate::CaptureError;
 
-/// Keeps the portal session (and with it the PipeWire stream) alive.
-pub(crate) struct PortalSession {
+/// What input injection needs from a RemoteDesktop session. Dropping it closes the session.
+pub(crate) struct RemoteControl {
     // Field order matters: the session must go before the runtime that drives its connection.
+    pub session: Session<RemoteDesktop>,
+    pub proxy: RemoteDesktop,
+    pub node: u32,
+    /// Logical size of the stream, the coordinate space of absolute pointer motion.
+    pub width: f64,
+    pub height: f64,
+    _screencast: Screencast,
+    pub runtime: tokio::runtime::Runtime,
+}
+
+/// A ScreenCast-only session, kept alive for as long as the capture runs.
+pub(crate) struct ViewOnly {
     _session: Session<Screencast>,
     _proxy: Screencast,
     _runtime: tokio::runtime::Runtime,
+}
+
+pub(crate) enum PortalSession {
+    Remote(Arc<RemoteControl>),
+    ViewOnly(#[allow(dead_code)] ViewOnly),
 }
 
 pub(crate) struct PortalStream {
@@ -28,16 +50,133 @@ pub(crate) struct PortalStream {
     pub pipewire_node: u32,
 }
 
-fn token_path() -> Option<PathBuf> {
+fn token_path(name: &str) -> Option<PathBuf> {
     let state = std::env::var_os("XDG_STATE_HOME")
         .map(PathBuf::from)
         .filter(|p| p.is_absolute())
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/state")))?;
-    Some(state.join("pyromirror/screencast-restore-token"))
+    Some(state.join("pyromirror").join(name))
+}
+
+fn load_token(name: &str) -> Option<String> {
+    let token = std::fs::read_to_string(token_path(name)?).ok()?;
+    let token = token.trim();
+    (!token.is_empty()).then(|| token.to_owned())
+}
+
+fn save_token(name: &str, token: Option<&str>) {
+    let (Some(path), Some(token)) = (token_path(name), token) else { return };
+    let saved = path.parent().map_or(Ok(()), std::fs::create_dir_all).and_then(|_| std::fs::write(&path, token));
+    if let Err(e) = saved {
+        log::warn!("Could not save the portal restore token to {}: {}", path.display(), e);
+    }
 }
 
 fn init_error(context: &str, e: impl std::fmt::Display) -> CaptureError {
     CaptureError::InitFailed(format!("{context}: {e}"))
+}
+
+fn first_stream(streams: &[Stream]) -> Result<&Stream, CaptureError> {
+    let stream = streams
+        .first()
+        .ok_or_else(|| CaptureError::InitFailed("the portal returned no streams".into()))?;
+    if let Some((w, h)) = stream.size() {
+        log::info!("Portal granted a {}x{} stream (PipeWire node {})", w, h, stream.pipe_wire_node_id());
+    }
+    Ok(stream)
+}
+
+const UNAVAILABLE: &str = "the ScreenCast portal is unavailable (is xdg-desktop-portal, with a backend \
+                           for your desktop, installed and running?)";
+const REMOTE_TOKEN: &str = "remote-desktop-restore-token";
+const SCREENCAST_TOKEN: &str = "screencast-restore-token";
+
+fn monitor_sources() -> SelectSourcesOptions {
+    // Embedded makes the compositor draw the pointer into the frames.
+    SelectSourcesOptions::default()
+        .set_cursor_mode(CursorMode::Embedded)
+        .set_sources(BitFlags::from(SourceType::Monitor))
+        .set_multiple(false)
+}
+
+/// Screen cast plus keyboard and pointer control. `Ok(None)` means this desktop's portal has no
+/// RemoteDesktop interface; errors after that point (e.g. the user declining) are final.
+async fn open_remote(screencast: &Screencast) -> Result<Option<(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64)>, CaptureError> {
+    // The portal is D-Bus activated, so a missing interface only shows up on the first call.
+    let Ok(remote) = RemoteDesktop::new().await else { return Ok(None) };
+    let session = match remote.create_session(Default::default()).await {
+        Ok(session) => session,
+        Err(e) => {
+            log::warn!("RemoteDesktop portal unavailable ({}); the session will be view-only", e);
+            return Ok(None);
+        }
+    };
+
+    let mut devices = SelectDevicesOptions::default().set_devices(DeviceType::Keyboard | DeviceType::Pointer);
+    // Persisting the grant needs RemoteDesktop version 2.
+    if remote.version() >= 2 {
+        let token = load_token(REMOTE_TOKEN);
+        devices = devices.set_persist_mode(PersistMode::ExplicitlyRevoked).set_restore_token(token.as_deref());
+    }
+    remote
+        .select_devices(&session, devices)
+        .await
+        .and_then(|request| request.response())
+        .map_err(|e| init_error("RemoteDesktop.SelectDevices failed", e))?;
+    screencast
+        .select_sources(&session, monitor_sources())
+        .await
+        .and_then(|request| request.response())
+        .map_err(|e| init_error("ScreenCast.SelectSources failed", e))?;
+
+    log::info!("Waiting for remote control permission (check for a dialog from your desktop)...");
+    let granted = remote
+        .start(&session, None, Default::default())
+        .await
+        .and_then(|request| request.response())
+        .map_err(|e| init_error("remote control was not granted", e))?;
+    save_token(REMOTE_TOKEN, granted.restore_token());
+
+    let stream = first_stream(granted.streams())?;
+    let node = stream.pipe_wire_node_id();
+    let (width, height) = stream.size().map_or((0.0, 0.0), |(w, h)| (w as f64, h as f64));
+
+    let fd = screencast
+        .open_pipe_wire_remote(&session, Default::default())
+        .await
+        .map_err(|e| init_error("ScreenCast.OpenPipeWireRemote failed", e))?;
+    Ok(Some((session, remote, fd.into_raw_fd(), node, width, height)))
+}
+
+async fn open_view_only(screencast: &Screencast) -> Result<(Session<Screencast>, RawFd, u32), CaptureError> {
+    let session = screencast.create_session(Default::default()).await.map_err(|e| init_error(UNAVAILABLE, e))?;
+
+    let mut sources = monitor_sources();
+    // Persisting the choice needs ScreenCast version 4.
+    if screencast.version() >= 4 {
+        let token = load_token(SCREENCAST_TOKEN);
+        sources = sources.set_persist_mode(PersistMode::ExplicitlyRevoked).set_restore_token(token.as_deref());
+    }
+    screencast
+        .select_sources(&session, sources)
+        .await
+        .and_then(|request| request.response())
+        .map_err(|e| init_error("ScreenCast.SelectSources failed", e))?;
+
+    log::info!("Waiting for screen sharing permission (check for a dialog from your desktop)...");
+    let streams = screencast
+        .start(&session, None, Default::default())
+        .await
+        .and_then(|request| request.response())
+        .map_err(|e| init_error("screen sharing was not granted", e))?;
+    save_token(SCREENCAST_TOKEN, streams.restore_token());
+    let node = first_stream(streams.streams())?.pipe_wire_node_id();
+
+    let fd = screencast
+        .open_pipe_wire_remote(&session, Default::default())
+        .await
+        .map_err(|e| init_error("ScreenCast.OpenPipeWireRemote failed", e))?;
+    Ok((session, fd.into_raw_fd(), node))
 }
 
 pub(crate) fn open() -> Result<PortalStream, CaptureError> {
@@ -50,74 +189,41 @@ pub(crate) fn open() -> Result<PortalStream, CaptureError> {
         .build()
         .map_err(|e| init_error("failed to start the portal runtime", e))?;
 
-    let token_path = token_path();
-    let saved_token = token_path.as_ref().and_then(|p| std::fs::read_to_string(p).ok());
-
-    let (proxy, session, fd, node, new_token) = runtime.block_on(async {
-        // The portal is D-Bus activated, so a missing portal only shows up on the first call.
-        const UNAVAILABLE: &str = "the ScreenCast portal is unavailable (is xdg-desktop-portal, with a \
-                                   backend for your desktop, installed and running?)";
-        let proxy = Screencast::new().await.map_err(|e| init_error(UNAVAILABLE, e))?;
-        let session = proxy
-            .create_session(Default::default())
-            .await
-            .map_err(|e| init_error(UNAVAILABLE, e))?;
-
-        // Embedded makes the compositor draw the pointer into the frames. Persisting the choice
-        // needs portal version 4.
-        let mut options = SelectSourcesOptions::default()
-            .set_cursor_mode(CursorMode::Embedded)
-            .set_sources(ashpd::enumflags2::BitFlags::from(SourceType::Monitor))
-            .set_multiple(false);
-        if proxy.version() >= 4 {
-            options = options
-                .set_persist_mode(PersistMode::ExplicitlyRevoked)
-                .set_restore_token(saved_token.as_deref().map(str::trim).filter(|t| !t.is_empty()));
-        }
-        proxy
-            .select_sources(&session, options)
-            .await
-            .and_then(|request| request.response())
-            .map_err(|e| init_error("ScreenCast.SelectSources failed", e))?;
-
-        log::info!("Waiting for screen sharing permission (check for a dialog from your desktop)...");
-        let streams = proxy
-            .start(&session, None, Default::default())
-            .await
-            .and_then(|request| request.response())
-            .map_err(|e| init_error("screen sharing was not granted", e))?;
-
-        let stream = streams
-            .streams()
-            .first()
-            .ok_or_else(|| CaptureError::InitFailed("the portal returned no streams".into()))?;
-        let node = stream.pipe_wire_node_id();
-        if let Some((w, h)) = stream.size() {
-            log::info!("Portal granted a {}x{} stream (PipeWire node {})", w, h, node);
-        }
-        let new_token = streams.restore_token().map(str::to_owned);
-
-        let fd = proxy
-            .open_pipe_wire_remote(&session, Default::default())
-            .await
-            .map_err(|e| init_error("ScreenCast.OpenPipeWireRemote failed", e))?;
-
-        Ok::<_, CaptureError>((proxy, session, fd, node, new_token))
-    })?;
-
-    if let (Some(path), Some(token)) = (token_path, new_token) {
-        let saved = path
-            .parent()
-            .map_or(Ok(()), std::fs::create_dir_all)
-            .and_then(|_| std::fs::write(&path, token));
-        if let Err(e) = saved {
-            log::warn!("Could not save the screen sharing restore token to {}: {}", path.display(), e);
-        }
+    enum Opened {
+        Remote(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64),
+        ViewOnly(Session<Screencast>, RawFd, u32),
     }
 
-    Ok(PortalStream {
-        session: PortalSession { _session: session, _proxy: proxy, _runtime: runtime },
-        pipewire_fd: fd.into_raw_fd(),
-        pipewire_node: node,
+    let (screencast, opened) = runtime.block_on(async {
+        let screencast = Screencast::new().await.map_err(|e| init_error(UNAVAILABLE, e))?;
+        let opened = match open_remote(&screencast).await? {
+            Some((session, remote, fd, node, w, h)) => Opened::Remote(session, remote, fd, node, w, h),
+            None => {
+                let (session, fd, node) = open_view_only(&screencast).await?;
+                Opened::ViewOnly(session, fd, node)
+            }
+        };
+        Ok::<_, CaptureError>((screencast, opened))
+    })?;
+
+    Ok(match opened {
+        Opened::Remote(session, proxy, pipewire_fd, node, width, height) => PortalStream {
+            session: PortalSession::Remote(Arc::new(RemoteControl {
+                session,
+                proxy,
+                node,
+                width,
+                height,
+                _screencast: screencast,
+                runtime,
+            })),
+            pipewire_fd,
+            pipewire_node: node,
+        },
+        Opened::ViewOnly(session, pipewire_fd, pipewire_node) => PortalStream {
+            session: PortalSession::ViewOnly(ViewOnly { _session: session, _proxy: screencast, _runtime: runtime }),
+            pipewire_fd,
+            pipewire_node,
+        },
     })
 }

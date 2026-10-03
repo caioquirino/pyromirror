@@ -6,6 +6,7 @@ members = [
     "crates/pyromirror-codec",
     "crates/pyromirror-net",
     "crates/pyromirror-capture",
+    "crates/pyromirror-audio",
     "crates/pyromirror-server",
     "crates/pyromirror-client",
 ]

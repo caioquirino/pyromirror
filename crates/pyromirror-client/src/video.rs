@@ -1,4 +1,4 @@
-//! UDP receive and decode thread.
+//! UDP receive thread: decodes video, passes audio on.
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,13 +9,14 @@ use crossbeam_channel::{Receiver, Sender, TrySendError};
 use log::{debug, error, info, warn};
 
 use pyromirror_codec::{Decoder, PixelFormat};
-use pyromirror_net::{frame_seq_is_newer, parse_video_datagram};
+use pyromirror_net::{frame_seq_is_newer, parse_datagram, Packet};
 
 #[derive(Default)]
 struct Stats {
     frames: u32,
     partial: u32,
     skipped: u32,
+    audio_packets: u32,
     bytes: usize,
     decode: Duration,
 }
@@ -32,6 +33,7 @@ pub fn receive_loop(
     height: u32,
     frames: Sender<Vec<u8>>,
     recycled: Receiver<Vec<u8>>,
+    audio: Option<Sender<Vec<i16>>>,
     running: Arc<AtomicBool>,
 ) {
     let stride = width as usize * 4;
@@ -41,6 +43,7 @@ pub fn receive_loop(
     let mut current_seq: Option<u32> = None;
     let mut packets_in_frame = 0u32;
     let mut frame_done = false;
+    let mut audio_seq: Option<u32> = None;
 
     let mut stats = Stats::default();
     let mut last_report = Instant::now();
@@ -73,7 +76,21 @@ pub fn receive_loop(
         match socket.recv_from(&mut datagram) {
             Ok((len, _)) => {
                 // Anything that does not parse is not ours (or is corrupt); ignore it.
-                let Ok(packet) = parse_video_datagram(&datagram[..len]) else { continue };
+                let packet = match parse_datagram(&datagram[..len]) {
+                    Ok(Packet::Video(packet)) => packet,
+                    Ok(Packet::Audio(packet)) => {
+                        stats.audio_packets += 1;
+                        // Late or duplicated audio would play out of order; drop it.
+                        let fresh = audio_seq.map_or(true, |last| frame_seq_is_newer(packet.seq, last));
+                        if let (true, Some(audio)) = (fresh, &audio) {
+                            audio_seq = Some(packet.seq);
+                            let pcm = packet.payload.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]]));
+                            let _ = audio.try_send(pcm.collect());
+                        }
+                        continue;
+                    }
+                    Err(_) => continue,
+                };
                 stats.bytes += len;
 
                 match current_seq {
@@ -120,12 +137,13 @@ pub fn receive_loop(
             if stats.frames > 0 || stats.skipped > 0 {
                 let log_degraded = stats.partial > 0 || stats.skipped > 0;
                 let message = format!(
-                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode+convert per frame, {} partial, {} skipped",
+                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode+convert per frame, {} partial, {} skipped, {} audio packets",
                     stats.frames as f64 / elapsed.as_secs_f64(),
                     stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
                     stats.decode.as_secs_f64() * 1000.0 / stats.frames.max(1) as f64,
                     stats.partial,
-                    stats.skipped
+                    stats.skipped,
+                    stats.audio_packets
                 );
                 if log_degraded {
                     info!("{}", message);

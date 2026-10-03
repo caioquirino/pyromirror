@@ -8,16 +8,17 @@ mod source;
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use clap::{Parser, ValueEnum};
 use log::{debug, error, info, trace, warn};
 
-use pyromirror_capture::{CaptureOptions, Capturer};
+use pyromirror_audio::AudioCapture;
+use pyromirror_capture::{CaptureOptions, Capturer, InputInjector};
 use pyromirror_codec::{Chroma, Device, Encoder, Packets};
-use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, FrameSender, UDP_PUNCH};
+use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent,
     VideoCodecType, VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO,
@@ -66,13 +67,37 @@ struct Args {
     #[arg(long, value_enum, default_value = "444")]
     chroma: ChromaArg,
 
+    /// Shrink the picture by this integer factor before encoding (2 turns 4K into 1080p)
+    #[arg(long, default_value_t = 1, value_parser = clap::value_parser!(u32).range(1..=8))]
+    scale: u32,
+
+    /// How fast datagrams are released, as a multiple of the bitrate. Lower values (down to 1.1)
+    /// smooth out bursts for Wi-Fi at the cost of a few milliseconds of latency
+    #[arg(long, default_value_t = 2.0, value_parser = parse_pace)]
+    pace_factor: f64,
+
     /// Windows: index of the monitor to capture (default: primary)
     #[arg(long)]
     monitor: Option<u32>,
 
+    /// Do not capture or send audio
+    #[arg(long)]
+    no_audio: bool,
+
+    /// Ignore the client's mouse and keyboard (view-only)
+    #[arg(long)]
+    no_input: bool,
+
     /// Stream a generated WIDTHxHEIGHT test pattern instead of the desktop, e.g. 1920x1080
     #[arg(long, value_name = "WxH", value_parser = parse_size)]
     test_pattern: Option<(u32, u32)>,
+}
+
+fn parse_pace(s: &str) -> Result<f64, String> {
+    match s.parse::<f64>() {
+        Ok(v) if (1.1..=100.0).contains(&v) => Ok(v),
+        _ => Err("expected a number between 1.1 and 100".into()),
+    }
 }
 
 fn parse_size(s: &str) -> Result<(u32, u32), String> {
@@ -91,6 +116,37 @@ struct Pipeline {
     max_frame_bytes: usize,
     packet_boundary: usize,
     frame_interval: Duration,
+    mtu: usize,
+    pace_mbps: u32,
+    injector: Option<InputInjector>,
+    audio: Option<Audio>,
+}
+
+/// Loopback audio capture. It runs for the lifetime of the server; samples are only queued while
+/// a client is being served.
+struct Audio {
+    _capture: AudioCapture,
+    samples: crossbeam_channel::Receiver<Vec<i16>>,
+    wanted: Arc<AtomicBool>,
+    sample_rate: u32,
+}
+
+impl Audio {
+    fn start() -> anyhow::Result<Self> {
+        // Roughly a second of audio; if the sender falls that far behind, newer audio is dropped.
+        let (tx, samples) = crossbeam_channel::bounded::<Vec<i16>>(256);
+        let wanted = Arc::new(AtomicBool::new(false));
+        let capture = {
+            let wanted = wanted.clone();
+            AudioCapture::start(move |pcm| {
+                if wanted.load(Ordering::Relaxed) {
+                    let _ = tx.try_send(pcm.to_vec());
+                }
+            })?
+        };
+        let sample_rate = capture.sample_rate();
+        Ok(Self { _capture: capture, samples, wanted, sample_rate })
+    }
 }
 
 /// Encodes a captured frame. Fails if the desktop no longer matches the encoder's size.
@@ -114,21 +170,32 @@ fn encode_frame<'e>(
 fn main() -> anyhow::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
+    pyromirror_capture::init_process();
 
     let chroma = match args.chroma {
         ChromaArg::C444 => Chroma::C444,
         ChromaArg::C420 => Chroma::C420,
     };
 
+    let mut injector = None;
     let mut source = match args.test_pattern {
         Some((w, h)) => {
             info!("Streaming a {}x{} test pattern instead of the desktop", w, h);
             Source::pattern(TestPattern::new(w, h))
         }
-        None => Source::capture(
-            Capturer::new(&CaptureOptions { output: args.monitor }).context("could not start desktop capture")?,
-        ),
-    };
+        None => {
+            let capturer =
+                Capturer::new(&CaptureOptions { output: args.monitor }).context("could not start desktop capture")?;
+            if !args.no_input {
+                injector = capturer.input_injector();
+                if injector.is_none() {
+                    warn!("This desktop does not allow input injection; clients will be view-only");
+                }
+            }
+            Source::capture(capturer)
+        }
+    }
+    .with_scale(args.scale);
 
     let device = Device::new().context("could not initialise PyroWave")?;
 
@@ -143,6 +210,9 @@ fn main() -> anyhow::Result<()> {
             Chroma::C444 => (first.width, first.height),
             Chroma::C420 => (first.width & !1, first.height & !1),
         };
+        if w < 16 || h < 16 {
+            bail!("--scale {} leaves only {}x{} pixels", args.scale, w, h);
+        }
         if w > u16::MAX as u32 || h > u16::MAX as u32 {
             bail!("desktop of {}x{} is larger than the protocol supports", w, h);
         }
@@ -163,19 +233,34 @@ fn main() -> anyhow::Result<()> {
         chroma
     );
 
+    let audio = if args.no_audio {
+        None
+    } else {
+        match Audio::start() {
+            Ok(audio) => {
+                info!("Capturing audio at {} Hz", audio.sample_rate);
+                Some(audio)
+            }
+            Err(e) => {
+                warn!("{}; streaming without audio", e);
+                None
+            }
+        }
+    };
+
     let params = CodecParameters {
         video_codec: VideoCodecType::PyroWave,
         video_color_profile: match chroma {
             Chroma::C444 => VideoColorProfile::Bt709FullChroma444,
             Chroma::C420 => VideoColorProfile::Bt709FullCenterChroma420,
         },
-        audio_codec: AudioCodecType::None,
+        audio_codec: if audio.is_some() { AudioCodecType::RawS16LE } else { AudioCodecType::None },
         frame_rate_num: args.fps as u16,
         frame_rate_den: 1,
         width: width as u16,
         height: height as u16,
-        audio_channels: 0,
-        audio_sample_rate: 0,
+        audio_channels: if audio.is_some() { pyromirror_audio::CHANNELS as u32 } else { 0 },
+        audio_sample_rate: audio.as_ref().map_or(0, |a| a.sample_rate),
     };
 
     let bind_addr = SocketAddr::new(args.bind, args.port);
@@ -184,19 +269,27 @@ fn main() -> anyhow::Result<()> {
         .with_context(|| format!("could not bind UDP {}", bind_addr))?;
     udp.set_read_timeout(Some(Duration::from_millis(100)))?;
 
+    // By default a frame is fully on the wire within half a frame interval instead of being
+    // spread across all of it.
+    let pace_mbps = ((args.bitrate_mbps as f64 * args.pace_factor).ceil() as u32).max(1);
+
     let mut pipeline = Pipeline {
         source,
         encoder,
         max_frame_bytes,
         packet_boundary: boundary,
         frame_interval: Duration::from_secs_f64(1.0 / args.fps as f64),
+        mtu: args.mtu as usize,
+        pace_mbps,
+        injector,
+        audio,
     };
 
     info!("Listening on {} (TCP control + UDP video); waiting for a client", bind_addr);
     loop {
         let (tcp, client_addr) = listener.accept()?;
         info!("Client connected from {}", client_addr);
-        match serve_client(tcp, client_addr, &udp, &params, &mut pipeline, args.bitrate_mbps) {
+        match serve_client(tcp, client_addr, &udp, &params, &mut pipeline) {
             Ok(()) => info!("Client {} disconnected", client_addr),
             Err(e) => {
                 error!("Session with {} ended: {:#}", client_addr, e);
@@ -214,7 +307,6 @@ fn serve_client(
     udp: &UdpSocket,
     params: &CodecParameters,
     pipeline: &mut Pipeline,
-    bitrate_mbps: u32,
 ) -> anyhow::Result<()> {
     tcp.set_nodelay(true)?;
 
@@ -241,6 +333,14 @@ fn serve_client(
     let punch_socket = udp.try_clone()?;
     let send_socket = udp.try_clone()?;
 
+    let (stream_w, stream_h) = (params.width as f64, params.height as f64);
+    let Pipeline { injector, audio, mtu, pace_mbps, .. } = pipeline;
+    // Only the channel and the flag cross into the audio thread; the capture itself stays put.
+    let audio = audio.as_ref().map(|a| (&a.samples, &*a.wanted));
+    let (injector, mtu, pace_mbps) = (injector.as_ref(), *mtu, *pace_mbps);
+    let audio_socket = udp.try_clone()?;
+    let (running, target) = (&running, &target);
+
     std::thread::scope(|scope| {
         // Control channel: input events, and the signal that the client went away.
         scope.spawn(|| {
@@ -249,17 +349,49 @@ fn serve_client(
             while running.load(Ordering::Relaxed) {
                 match read_message(&mut control, &mut payload) {
                     Ok((MSG_TYPE_INPUT_EVENT, len)) => match InputEvent::deserialize(&payload[..len]) {
-                        // TODO: inject into the desktop (SendInput on Windows, RemoteDesktop
-                        // portal / uinput on Linux).
-                        Ok(event) => trace!("Input event: {:?}", event),
+                        Ok(event) => {
+                            match event {
+                                // Motion is far too frequent to log above trace level.
+                                InputEvent::MouseMoveAbsolute { .. } | InputEvent::MouseMoveRelative { .. } => {
+                                    trace!("Input event: {:?}", event)
+                                }
+                                _ => debug!("Input event: {:?}", event),
+                            }
+                            if let Some(injector) = injector {
+                                inject(injector, event, stream_w, stream_h);
+                            }
+                        }
                         Err(e) => debug!("Undecodable input event: {}", e),
                     },
                     Ok((other, _)) => debug!("Ignoring control message type {}", other),
                     Err(_) => break,
                 }
             }
+            // Do not leave keys or buttons stuck down on the host.
+            if let Some(injector) = injector {
+                injector.release_all();
+            }
             running.store(false, Ordering::Relaxed);
         });
+
+        if let Some((samples, wanted)) = audio {
+            scope.spawn(move || {
+                let mut sender =
+                    AudioSender::new(audio_socket, *target.lock().unwrap(), mtu, pyromirror_audio::CHANNELS as usize);
+                let start = Instant::now();
+                // Anything still queued belongs to the previous client.
+                while samples.try_recv().is_ok() {}
+                wanted.store(true, Ordering::Relaxed);
+                while running.load(Ordering::Relaxed) {
+                    if let Ok(pcm) = samples.recv_timeout(Duration::from_millis(100)) {
+                        sender.set_target_addr(*target.lock().unwrap());
+                        // A failed send only costs a few milliseconds of sound.
+                        let _ = sender.send(&pcm, start.elapsed().as_micros() as u64);
+                    }
+                }
+                wanted.store(false, Ordering::Relaxed);
+            });
+        }
 
         // The client keeps sending small datagrams from its video socket. If it sits behind NAT,
         // their source address is where video has to go, rather than the port it announced.
@@ -278,26 +410,51 @@ fn serve_client(
             }
         });
 
-        let result = stream_video(pipeline, send_socket, &target, &running, bitrate_mbps);
+        let result = stream_video(
+            &mut pipeline.source,
+            &mut pipeline.encoder,
+            pipeline.max_frame_bytes,
+            pipeline.packet_boundary,
+            pipeline.frame_interval,
+            send_socket,
+            target,
+            running,
+            pace_mbps,
+        );
         running.store(false, Ordering::Relaxed);
         let _ = tcp.shutdown(Shutdown::Both);
         result
     })
 }
 
+/// Applies one client input event to the host desktop.
+fn inject(injector: &InputInjector, event: InputEvent, stream_w: f64, stream_h: f64) {
+    match event {
+        // Absolute positions arrive in stream pixels.
+        InputEvent::MouseMoveAbsolute { x, y } => {
+            injector.pointer_absolute((x as f64 + 0.5) / stream_w, (y as f64 + 0.5) / stream_h)
+        }
+        InputEvent::MouseMoveRelative { dx, dy } => injector.pointer_relative(dx as f64, dy as f64),
+        InputEvent::MouseButton { button, down } => injector.button(button, down),
+        InputEvent::MouseWheel { dx, dy } => injector.wheel(dx as i32, dy as i32),
+        InputEvent::KeyboardKey { scancode, down, .. } => injector.key(scancode, down),
+        InputEvent::Gamepad { .. } => {}
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn stream_video(
-    pipeline: &mut Pipeline,
+    source: &mut Source,
+    encoder: &mut Encoder,
+    max_frame_bytes: usize,
+    packet_boundary: usize,
+    frame_interval: Duration,
     socket: UdpSocket,
     target: &Mutex<SocketAddr>,
     running: &AtomicBool,
-    bitrate_mbps: u32,
+    pace_mbps: u32,
 ) -> anyhow::Result<()> {
-    let Pipeline { source, encoder, max_frame_bytes, packet_boundary, frame_interval } = pipeline;
-    let (max_frame_bytes, packet_boundary, frame_interval) = (*max_frame_bytes, *packet_boundary, *frame_interval);
-
-    // Release datagrams at twice the video bitrate: a frame is fully on the wire within half a
-    // frame interval instead of being spread across all of it.
-    let mut sender = FrameSender::new(socket, *target.lock().unwrap(), bitrate_mbps.saturating_mul(2));
+    let mut sender = FrameSender::new(socket, *target.lock().unwrap(), pace_mbps);
 
     let start = Instant::now();
     let mut last_sent: Option<Instant> = None;

@@ -14,14 +14,15 @@ What works today:
 
 * **Video, end to end:** desktop capture → PyroWave encode (Vulkan compute) → UDP → PyroWave decode → SDL3 window, on Windows and Linux, in 4:4:4 or 4:2:0.
 * **Capture backends:** DXGI Desktop Duplication on Windows; xdg-desktop-portal ScreenCast + PipeWire on Linux (Wayland, and X11 sessions on desktops that ship a portal backend).
+* **Mouse and keyboard:** injected with `SendInput` on Windows and through the RemoteDesktop portal on Linux (GNOME, KDE; wlroots desktops have no such portal and stay view-only). Keys are sent as physical key positions, so the host's keyboard layout applies.
+* **Audio:** whatever the host plays (WASAPI loopback on Windows, the default sink's monitor via PipeWire on Linux) is sent as uncompressed 16-bit stereo and played by the client.
 * **Loss handling:** every datagram carries one independently decodable PyroWave packet, so lost packets blur a few blocks of one frame instead of stalling the stream.
 
 Not implemented yet:
 
-* **Input injection.** The client sends mouse and keyboard events, but the server only logs them.
 * **Zero-copy capture.** Frames take a CPU round trip (colour conversion + upload) on both ends; the D3D11 shared-texture / DMA-BUF paths of PyroWave are not wired up yet.
 * **HDR.** With HDR enabled on Windows the capture is an SDR conversion that looks washed out.
-* **Mouse pointer on Windows** (Desktop Duplication delivers it separately), **audio**, **FEC**, **resolution changes while streaming**, and the **Android client**.
+* **Mouse pointer on Windows** (Desktop Duplication delivers it separately; the viewer's own pointer shows the position), **gamepads**, **clipboard**, **FEC**, **resolution changes while streaming**, and the **Android client**.
 
 ---
 
@@ -195,12 +196,18 @@ cargo run --release --bin pyromirror-server -- \
 * `--chroma <420|444>`: Chroma subsampling (default: `444` for sharp text; `420` saves bandwidth).
 * `--fps <FPS>`: Maximum framerate (default: `60`).
 * `--mtu <BYTES>`: UDP datagram size (default: `1400` for standard Ethernet; `8900` for jumbo frames).
+* `--scale <N>`: Shrink the picture by an integer factor before encoding (default: `1`; `2` turns a 4K desktop into a 1080p stream).
+* `--pace-factor <X>`: Release datagrams at X times the bitrate (default: `2`). Lower values, down to `1.1`, smooth out bursts on Wi-Fi at the cost of a few milliseconds of latency.
+* `--no-audio`: Do not capture or send audio.
+* `--no-input`: Ignore the client's mouse and keyboard (view-only).
 * `--monitor <INDEX>`: Windows only, monitor to capture (default: primary). On Linux the portal dialog picks the monitor.
 * `--test-pattern <WxH>`: Stream a generated pattern instead of the desktop, to test codec and network without capture.
 
-The stream always has the resolution of the captured monitor. Set `RUST_LOG=debug` on either side for per-second fps / bitrate / timing statistics.
+The stream has the resolution of the captured monitor divided by `--scale`. Set `RUST_LOG=debug` on either side for per-second fps / bitrate / timing statistics.
 
-On Linux the first start shows your desktop's screen sharing dialog. The choice is remembered in `~/.local/state/pyromirror/screencast-restore-token`; delete that file to be asked again.
+On Linux the first start shows your desktop's remote control / screen sharing dialog. The grant is remembered in `~/.local/state/pyromirror/`; delete the token files there to be asked again.
+
+On Windows, input cannot reach elevated (administrator) windows or UAC prompts unless the server itself runs as administrator.
 
 On Windows, allow the server through the firewall when prompted (TCP and UDP on the chosen port).
 
@@ -216,6 +223,8 @@ cargo run --release --bin pyromirror-client -- pyro://192.168.1.100:9000
 * **`Ctrl + Alt + F`**: Toggle fullscreen.
 * **`Ctrl + Alt + M`**: Toggle relative mouse mode.
 * **`Ctrl + Alt + Q`**: Quit.
+
+`--no-audio` on the client mutes the host's audio.
 
 ---
 

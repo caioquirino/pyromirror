@@ -228,6 +228,18 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
     return PYROMIRROR_CAPTURE_FRAME;
 }
 
+extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context* ctx, int32_t* x, int32_t* y, uint32_t* width, uint32_t* height) {
+    DXGI_OUTPUT_DESC desc = {};
+    if (!ctx || FAILED(ctx->output->GetDesc(&desc))) {
+        return false;
+    }
+    *x = desc.DesktopCoordinates.left;
+    *y = desc.DesktopCoordinates.top;
+    *width = static_cast<uint32_t>(desc.DesktopCoordinates.right - desc.DesktopCoordinates.left);
+    *height = static_cast<uint32_t>(desc.DesktopCoordinates.bottom - desc.DesktopCoordinates.top);
+    return true;
+}
+
 extern "C" bool pyromirror_capture_hdr_active(pyromirror_capture_context* ctx) {
     ComPtr<IDXGIOutput6> output6;
     DXGI_OUTPUT_DESC1 desc = {};

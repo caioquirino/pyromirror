@@ -22,15 +22,24 @@ enum Kind {
 pub struct Source {
     kind: Kind,
     lost: bool,
+    /// Integer downscale factor applied to every frame (1 = off).
+    scale: u32,
+    scaled: Vec<u8>,
 }
 
 impl Source {
     pub fn capture(capturer: Capturer) -> Self {
-        Self { kind: Kind::Capture(capturer), lost: false }
+        Self { kind: Kind::Capture(capturer), lost: false, scale: 1, scaled: Vec::new() }
     }
 
     pub fn pattern(pattern: TestPattern) -> Self {
-        Self { kind: Kind::Pattern(pattern), lost: false }
+        Self { kind: Kind::Pattern(pattern), lost: false, scale: 1, scaled: Vec::new() }
+    }
+
+    /// Shrinks every frame by an integer factor before it is handed out.
+    pub fn with_scale(mut self, scale: u32) -> Self {
+        self.scale = scale.max(1);
+        self
     }
 
     /// True once the capture backend has failed for good.
@@ -43,9 +52,10 @@ impl Source {
         if self.lost {
             bail!("desktop capture is no longer running");
         }
-        match &mut self.kind {
+        let Self { kind, lost, scale, scaled } = self;
+        let frame = match kind {
             Kind::Capture(capturer) => match capturer.next_frame(timeout) {
-                Ok(frame) => Ok(frame.map(|frame| SourceFrame {
+                Ok(frame) => frame.map(|frame| SourceFrame {
                     data: frame.data,
                     width: frame.width,
                     height: frame.height,
@@ -54,14 +64,22 @@ impl Source {
                         CaptureFormat::Bgrx => PixelFormat::Bgrx,
                         CaptureFormat::Rgbx => PixelFormat::Rgbx,
                     },
-                })),
+                }),
                 Err(e) => {
-                    self.lost = true;
-                    Err(e.into())
+                    *lost = true;
+                    return Err(e.into());
                 }
             },
-            Kind::Pattern(pattern) => Ok(Some(pattern.next_frame(timeout))),
-        }
+            Kind::Pattern(pattern) => Some(pattern.next_frame(timeout)),
+        };
+
+        Ok(match frame {
+            Some(frame) if *scale > 1 => {
+                let (width, height) = downscale(&frame, *scale as usize, scaled);
+                Some(SourceFrame { data: scaled, width, height, stride: width * 4, format: frame.format })
+            }
+            other => other,
+        })
     }
 
     /// Blocks until the first frame arrives (which is what reveals the desktop resolution) and
@@ -122,6 +140,72 @@ impl TestPattern {
             height: self.height,
             stride: self.width * 4,
             format: PixelFormat::Rgbx,
+        }
+    }
+}
+
+/// Box-filters `frame` down by `factor` in both directions into `out` (tightly packed rows).
+/// Rows and columns that do not fill a whole block are dropped. Returns the new size.
+fn downscale(frame: &SourceFrame<'_>, factor: usize, out: &mut Vec<u8>) -> (u32, u32) {
+    let (out_w, out_h) = (frame.width as usize / factor, frame.height as usize / factor);
+    out.resize(out_w * out_h * 4, 255);
+    if out_w == 0 || out_h == 0 {
+        return (0, 0);
+    }
+
+    let (src, stride) = (frame.data, frame.stride as usize);
+    let area = (factor * factor) as u32;
+    let threads = std::thread::available_parallelism().map_or(4, |n| n.get()).clamp(1, 8);
+    let band_rows = out_h.div_ceil(threads);
+
+    std::thread::scope(|scope| {
+        for (band, out) in out.chunks_mut(band_rows * out_w * 4).enumerate() {
+            scope.spawn(move || {
+                for (i, out_row) in out.chunks_exact_mut(out_w * 4).enumerate() {
+                    let first_src_row = (band * band_rows + i) * factor;
+                    for (x, px) in out_row.chunks_exact_mut(4).enumerate() {
+                        let mut sum = [area / 2; 3];
+                        for row in first_src_row..first_src_row + factor {
+                            let block = &src[row * stride + x * factor * 4..][..factor * 4];
+                            for p in block.chunks_exact(4) {
+                                sum[0] += p[0] as u32;
+                                sum[1] += p[1] as u32;
+                                sum[2] += p[2] as u32;
+                            }
+                        }
+                        px[0] = (sum[0] / area) as u8;
+                        px[1] = (sum[1] / area) as u8;
+                        px[2] = (sum[2] / area) as u8;
+                    }
+                }
+            });
+        }
+    });
+    (out_w as u32, out_h as u32)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn downscale_averages_blocks_and_drops_remainder() {
+        // 5x4 image with stride padding; left 2x2 blocks are 10/30 (avg 20), next are all 100.
+        let (w, h, stride) = (5usize, 4usize, 24usize);
+        let mut data = vec![0u8; stride * h];
+        for y in 0..h {
+            for x in 0..w {
+                let v = if x < 2 { if (x + y) % 2 == 0 { 10 } else { 30 } } else { 100 };
+                data[y * stride + x * 4..][..4].copy_from_slice(&[v, v / 2, 7, 0]);
+            }
+        }
+        let frame = SourceFrame { data: &data, width: 5, height: 4, stride: stride as u32, format: PixelFormat::Bgrx };
+        let mut out = Vec::new();
+        assert_eq!(downscale(&frame, 2, &mut out), (2, 2));
+        assert_eq!(out.len(), 2 * 2 * 4);
+        for row in out.chunks_exact(8) {
+            assert_eq!(&row[..4], &[20, 10, 7, 255]);
+            assert_eq!(&row[4..], &[100, 50, 7, 255]);
         }
     }
 }

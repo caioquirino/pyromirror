@@ -268,6 +268,10 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
 extern "C" void pyromirror_capture_release(pyromirror_capture_context*) {
 }
 
+extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context*, int32_t*, int32_t*, uint32_t*, uint32_t*) {
+    return false;
+}
+
 extern "C" bool pyromirror_capture_hdr_active(pyromirror_capture_context*) {
     return false;
 }

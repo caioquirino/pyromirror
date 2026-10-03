@@ -23,12 +23,14 @@ use sdl3::render::FRect;
 use pyromirror_codec::{Chroma, Decoder, Device};
 use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
 use pyromirror_proto::{
-    read_message, write_message, ClientHello, CodecParameters, InputEvent, VideoCodecType,
+    read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent, VideoCodecType,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
     MSG_TYPE_INPUT_EVENT,
 };
 
 const DEFAULT_PORT: u16 = 9000;
+const AUDIO_CUSHION_MS: usize = 40;
+const AUDIO_MAX_QUEUED_MS: usize = 200;
 
 #[derive(Parser, Debug)]
 #[command(name = "pyromirror-client", version, about = "PyroMirror low-latency remote desktop viewer")]
@@ -47,6 +49,10 @@ struct Args {
     /// Local UDP port to receive video on (0 lets the OS pick)
     #[arg(long, default_value_t = 0)]
     local_port: u16,
+
+    /// Do not play the host's audio
+    #[arg(long)]
+    no_audio: bool,
 
     /// Exit after this many seconds (for automated testing)
     #[arg(long, hide = true)]
@@ -165,6 +171,41 @@ fn main() -> anyhow::Result<()> {
         .create_texture_streaming(PixelFormat::RGBA32, width, height)
         .context("could not create the video texture")?;
 
+    // Audio: packets are queued into an SDL stream, which resamples to whatever the device wants.
+    let audio_rate = params.audio_sample_rate as usize;
+    let audio_channels = params.audio_channels as usize;
+    let audio_stream = if args.no_audio || params.audio_codec != AudioCodecType::RawS16LE || audio_rate == 0 || audio_channels == 0 {
+        None
+    } else {
+        let spec = sdl3::audio::AudioSpec {
+            freq: Some(audio_rate as i32),
+            channels: Some(audio_channels as i32),
+            format: Some(sdl3::audio::AudioFormat::S16LE),
+        };
+        let opened = sdl.audio().and_then(|audio| {
+            let stream = audio.default_playback_device().open_device_stream(Some(&spec))?;
+            stream.resume()?;
+            Ok(stream)
+        });
+        match opened {
+            Ok(stream) => {
+                info!("Audio: {} Hz, {} channels", audio_rate, audio_channels);
+                Some(stream)
+            }
+            Err(e) => {
+                warn!("No audio playback: {}", e);
+                None
+            }
+        }
+    };
+    let (audio_tx, audio_rx) = crossbeam_channel::bounded::<Vec<i16>>(256);
+    let audio_tx = audio_stream.is_some().then_some(audio_tx);
+    // Queue this much before playback so network jitter does not cause dropouts, and start over
+    // if the queue grows well past it (the two clocks drift apart slowly).
+    let bytes_per_ms = audio_rate * audio_channels * 2 / 1000;
+    let audio_cushion = vec![0i16; audio_rate * audio_channels * AUDIO_CUSHION_MS / 1000];
+    let audio_max_queued = (bytes_per_ms * AUDIO_MAX_QUEUED_MS) as i32;
+
     // 5. Background threads: video receive/decode, UDP keepalive, control-channel watchdog.
     let running = Arc::new(AtomicBool::new(true));
     let (frame_tx, frame_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
@@ -174,7 +215,7 @@ fn main() -> anyhow::Result<()> {
         let (udp, running) = (udp.try_clone()?, running.clone());
         std::thread::Builder::new()
             .name("video".into())
-            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, running))?
+            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, running))?
     };
 
     {
@@ -281,6 +322,19 @@ fn main() -> anyhow::Result<()> {
                     warn!("Lost the control connection");
                     break 'main;
                 }
+            }
+        }
+
+        if let Some(stream) = &audio_stream {
+            for pcm in audio_rx.try_iter() {
+                let queued = stream.queued_bytes().unwrap_or(0);
+                if queued > audio_max_queued {
+                    let _ = stream.clear();
+                }
+                if queued == 0 || queued > audio_max_queued {
+                    let _ = stream.put_data_i16(&audio_cushion);
+                }
+                let _ = stream.put_data_i16(&pcm);
             }
         }
 
