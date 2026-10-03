@@ -3,6 +3,7 @@ name = "pyrowave-sys"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+links = "pyrowave-shared"
 
 [dependencies]
 

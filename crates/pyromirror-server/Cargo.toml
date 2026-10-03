@@ -7,11 +7,9 @@ license.workspace = true
 [dependencies]
 pyromirror-proto = { path = "../pyromirror-proto" }
 pyromirror-net = { path = "../pyromirror-net" }
-pyrowave-sys = { path = "../pyrowave-sys" }
+pyromirror-codec = { path = "../pyromirror-codec" }
 pyromirror-capture = { path = "../pyromirror-capture" }
-byteorder = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }
-tokio = { workspace = true }

@@ -1,342 +1,328 @@
-//! PyroMirror Client Viewer
+//! PyroMirror client.
 //!
-//! Receives UDP PyroWave packets, presents via SDL3 Canvas/Texture,
-//! and forwards low-latency input.
+//! Receives PyroWave packets over UDP, decodes them on the GPU and shows the result in an SDL3
+//! window. Mouse and keyboard events go back to the server over the TCP control connection.
 
-use clap::Parser;
-use log::{error, info, warn};
-use std::net::SocketAddr;
+mod video;
+
+use std::io::Read;
+use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Instant;
-use std::io::{Read, Write};
-use byteorder::ByteOrder;
+use std::time::{Duration, Instant};
 
+use anyhow::{bail, Context};
+use clap::Parser;
+use log::{info, warn};
+use sdl3::event::{Event, WindowEvent};
+use sdl3::keyboard::{Keycode, Mod};
 use sdl3::pixels::{Color, PixelFormat};
-use sdl3::rect::Rect;
+use sdl3::render::FRect;
 
+use pyromirror_codec::{Chroma, Decoder, Device};
+use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
 use pyromirror_proto::{
-    make_message_type, validate_magic, ClientHello, CodecParameters, InputEvent,
-    MSG_TYPE_CLIENT_HELLO,
+    read_message, write_message, ClientHello, CodecParameters, InputEvent, VideoCodecType,
+    VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
+    MSG_TYPE_INPUT_EVENT,
 };
-use pyromirror_net::{create_streaming_socket, FrameReceiver};
+
+const DEFAULT_PORT: u16 = 9000;
 
 #[derive(Parser, Debug)]
-#[command(name = "pyromirror-client", version, about = "PyroMirror Ultra-Low-Latency Remote Desktop Client")]
+#[command(name = "pyromirror-client", version, about = "PyroMirror low-latency remote desktop viewer")]
 struct Args {
-    /// Remote host address in format pyro://<ip>:<port> or <ip>:<port>
+    /// Server address: pyro://<host>[:<port>] or <host>[:<port>]
     uri: String,
 
-    /// Force fragment shader decoding path (optimized for mobile/integrated GPUs)
-    #[arg(long, default_value_t = false)]
+    /// Decode with fragment shaders instead of compute (meant for mobile / weak integrated GPUs)
+    #[arg(long)]
     force_fragment: bool,
 
     /// Start in fullscreen mode
-    #[arg(short, long, default_value_t = false)]
+    #[arg(short, long)]
     fullscreen: bool,
 
-    /// Local port to receive UDP video stream (0 for OS dynamic port)
+    /// Local UDP port to receive video on (0 lets the OS pick)
     #[arg(long, default_value_t = 0)]
     local_port: u16,
+
+    /// Exit after this many seconds (for automated testing)
+    #[arg(long, hide = true)]
+    exit_after: Option<f64>,
+
+    /// Write the most recent frame to this file as a PPM image on exit (for automated testing)
+    #[arg(long, hide = true)]
+    dump_frame: Option<PathBuf>,
 }
 
-fn parse_uri(uri: &str) -> anyhow::Result<SocketAddr> {
-    let clean = uri.trim_start_matches("pyro://");
-    let addr: SocketAddr = clean.parse()?;
-    Ok(addr)
+fn resolve(uri: &str) -> anyhow::Result<SocketAddr> {
+    let host = uri.trim_start_matches("pyro://").trim_end_matches('/');
+    let with_port = if host.parse::<SocketAddr>().is_ok() || host.rsplit_once(':').is_some_and(|(_, p)| p.parse::<u16>().is_ok()) {
+        host.to_string()
+    } else {
+        format!("{}:{}", host, DEFAULT_PORT)
+    };
+    with_port
+        .to_socket_addrs()
+        .with_context(|| format!("could not resolve `{}`", with_port))?
+        .next()
+        .with_context(|| format!("`{}` has no address", with_port))
+}
+
+fn send_input(tcp: &mut TcpStream, event: InputEvent) -> bool {
+    let mut buf = [0u8; 32];
+    match event.serialize(&mut buf) {
+        Ok(len) => write_message(tcp, MSG_TYPE_INPUT_EVENT, &buf[..len]).is_ok(),
+        Err(_) => true,
+    }
+}
+
+/// Largest rectangle with the stream's aspect ratio that fits the window, centred.
+fn letterbox(window: (u32, u32), stream: (u32, u32)) -> FRect {
+    let (ww, wh) = (window.0.max(1) as f32, window.1.max(1) as f32);
+    let scale = (ww / stream.0 as f32).min(wh / stream.1 as f32);
+    let (w, h) = (stream.0 as f32 * scale, stream.1 as f32 * scale);
+    FRect::new((ww - w) / 2.0, (wh - h) / 2.0, w, h)
 }
 
 fn main() -> anyhow::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
-
     let args = Args::parse();
-    let server_addr = parse_uri(&args.uri)?;
+    let server_addr = resolve(&args.uri)?;
 
-    info!("🔥 Connecting to PyroMirror Server at {}", server_addr);
-
-    // 1. Setup UDP receiving socket with 32MB buffer first to get local listening port
-    let udp_socket = create_streaming_socket(
-        Some(SocketAddr::from(([0, 0, 0, 0], args.local_port))),
-        32 * 1024 * 1024,
-    )?;
-    let std_udp_socket: std::net::UdpSocket = udp_socket.into();
-    std_udp_socket.set_read_timeout(Some(std::time::Duration::from_millis(50)))?;
-    let local_udp_port = std_udp_socket.local_addr()?.port();
-    info!("Local UDP video receiver bound on port {}", local_udp_port);
-
-    // 2. Connect control TCP stream
-    let mut tcp_stream = std::net::TcpStream::connect(server_addr)?;
-    tcp_stream.set_nodelay(true)?;
-    info!("Connected to server control channel");
-
-    // 3. Send ClientHello immediately so server knows our UDP receiving port
-    let hello = ClientHello {
-        udp_port: local_udp_port,
-        flags: 0,
+    // 1. Bind the video socket first so its port can be announced in the handshake.
+    let unspecified: std::net::IpAddr = if server_addr.is_ipv6() {
+        std::net::Ipv6Addr::UNSPECIFIED.into()
+    } else {
+        std::net::Ipv4Addr::UNSPECIFIED.into()
     };
-    let mut hello_buf = [0u8; ClientHello::SIZE];
-    hello.serialize(&mut hello_buf)?;
-    let hello_header = make_message_type(MSG_TYPE_CLIENT_HELLO, ClientHello::SIZE as u32);
-    let mut hello_msg = [0u8; 4 + ClientHello::SIZE];
-    byteorder::LittleEndian::write_u32(&mut hello_msg[0..4], hello_header);
-    hello_msg[4..].copy_from_slice(&hello_buf);
-    tcp_stream.write_all(&hello_msg)?;
-    info!("Sent ClientHello announcing UDP port {}", local_udp_port);
+    let udp = create_streaming_socket(SocketAddr::new(unspecified, args.local_port), 32 * 1024 * 1024)
+        .context("could not bind the UDP video socket")?;
+    udp.set_read_timeout(Some(Duration::from_millis(50)))?;
+    let local_udp_port = udp.local_addr()?.port();
 
-    // 4. Send UDP punch packets directly to server to open stateful NAT/firewall pinhole
-    for _ in 0..3 {
-        let _ = std_udp_socket.send_to(b"PYROMIRROR_UDP_PUNCH", server_addr);
-        std::thread::sleep(std::time::Duration::from_millis(5));
+    // 2. Handshake over TCP.
+    info!("Connecting to {}", server_addr);
+    let mut tcp = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))
+        .with_context(|| format!("could not connect to {}", server_addr))?;
+    tcp.set_nodelay(true)?;
+
+    let mut hello = [0u8; ClientHello::SIZE];
+    ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
+    write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
+
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
+    let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no reply from the server")?;
+    if msg_type != MSG_TYPE_CODEC_PARAMS {
+        bail!("unexpected handshake reply (message type {})", msg_type);
     }
-    info!("Sent initial UDP punch packets to server at {}", server_addr);
+    let params = CodecParameters::deserialize(&payload[..len])?;
+    tcp.set_read_timeout(None)?;
 
-    // 5. Read codec parameters from server
-    let mut header_buf = [0u8; 4];
-    tcp_stream.read_exact(&mut header_buf)?;
-    let magic = byteorder::LittleEndian::read_u32(&header_buf);
-    if !validate_magic(magic) {
-        anyhow::bail!("Invalid handshake response from server: {:#x}", magic);
+    if params.video_codec != VideoCodecType::PyroWave {
+        bail!("server offers {:?}, this client only decodes PyroWave", params.video_codec);
     }
+    let chroma = match params.video_color_profile {
+        VideoColorProfile::Bt709FullChroma444 => Chroma::C444,
+        VideoColorProfile::Bt709FullCenterChroma420 => Chroma::C420,
+        other => bail!("unsupported colour profile {:?}", other),
+    };
+    let (width, height) = (params.width as u32, params.height as u32);
+    info!("Stream: {}x{} @ {} fps, chroma {:?}; receiving on UDP port {}", width, height, params.frame_rate_num, chroma, local_udp_port);
 
-    let mut param_buf = [0u8; CodecParameters::SIZE];
-    tcp_stream.read_exact(&mut param_buf)?;
-    let codec_params = CodecParameters::deserialize(&param_buf)?;
-    info!(
-        "Stream Negotiated: {}x{} @ {} FPS, Codec: {:?}, Color: {:?}",
-        codec_params.width, codec_params.height, codec_params.frame_rate_num,
-        codec_params.video_codec, codec_params.video_color_profile
-    );
+    // 3. Decoder.
+    let device = Device::new().context("could not initialise PyroWave")?;
+    let fragment_path = args.force_fragment || device.prefers_fragment_decode();
+    let decoder = Decoder::new(device, width, height, chroma, fragment_path)
+        .context("could not create the PyroWave decoder")?;
 
-    // 6. Initialize SDL3 Window and Canvas
+    // 4. Window.
     let sdl = sdl3::init()?;
-    let video = sdl.video()?;
+    let video_subsystem = sdl.video()?;
 
-    let mut window_builder = video.window(
-        "PyroMirror Viewer",
-        codec_params.width as u32,
-        codec_params.height as u32,
-    );
-    window_builder.resizable();
+    // Start at the stream's size unless that does not fit the screen.
+    let (mut win_w, mut win_h) = (width, height);
+    if let Ok(bounds) = video_subsystem.get_primary_display().and_then(|d| d.get_usable_bounds()) {
+        let (max_w, max_h) = (bounds.width() * 9 / 10, bounds.height() * 9 / 10);
+        if win_w > max_w || win_h > max_h {
+            let scale = (max_w as f32 / win_w as f32).min(max_h as f32 / win_h as f32);
+            win_w = ((win_w as f32 * scale) as u32).max(1);
+            win_h = ((win_h as f32 * scale) as u32).max(1);
+        }
+    }
+
+    let mut window_builder = video_subsystem.window("PyroMirror", win_w, win_h);
+    window_builder.resizable().position_centered();
     if args.fullscreen {
         window_builder.fullscreen();
     }
-
-    let window = window_builder.build()?;
-    let mut canvas = window.into_canvas();
-    info!("SDL3 Window & Canvas initialized successfully");
-
-    // Create streaming texture for video presentation (RGBA32 byte-ordered)
+    let mut canvas = window_builder.build()?.into_canvas();
     let texture_creator = canvas.texture_creator();
     let mut texture = texture_creator
-        .create_texture_streaming(PixelFormat::RGBA32, codec_params.width as u32, codec_params.height as u32)
-        .map_err(|e| anyhow::anyhow!("Failed to create streaming texture: {}", e))?;
+        .create_texture_streaming(PixelFormat::RGBA32, width, height)
+        .context("could not create the video texture")?;
 
+    // 5. Background threads: video receive/decode, UDP keepalive, control-channel watchdog.
     let running = Arc::new(AtomicBool::new(true));
-    let running_recv = running.clone();
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
+    let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
-    // Channel to deliver assembled frames to main render thread
-    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
+    let video_thread = {
+        let (udp, running) = (udp.try_clone()?, running.clone());
+        std::thread::Builder::new()
+            .name("video".into())
+            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, running))?
+    };
 
-    // Keep sending UDP punch / keepalive in background to maintain firewall pinhole
-    let udp_sock_clone = std_udp_socket.try_clone()?;
-    std::thread::spawn(move || {
-        while running_recv.load(Ordering::Relaxed) {
-            let _ = udp_sock_clone.send_to(b"PYROMIRROR_UDP_KEEPALIVE", server_addr);
-            std::thread::sleep(std::time::Duration::from_millis(500));
-        }
-    });
-
-    let running_recv2 = running.clone();
-    // Calculate maximum frame capacity based on negotiated stream dimensions with generous headroom for 4K/8K
-    let uncompressed_frame_size = (codec_params.width as usize) * (codec_params.height as usize) * 4;
-    let max_frame_capacity = (uncompressed_frame_size * 2).max(128 * 1024 * 1024);
-    info!(
-        "Configured FrameReceiver capacity: {} MB (stream frame raw size: {:.2} MB)",
-        max_frame_capacity / (1024 * 1024),
-        uncompressed_frame_size as f64 / (1024.0 * 1024.0)
-    );
-
-    // 7. Spawn video packet receiving and assembly thread
-    let recv_handle = std::thread::spawn(move || {
-        let mut receiver = FrameReceiver::new(max_frame_capacity);
-        let mut packet_buf = [0u8; 65536];
-        let mut frames_received: u64 = 0;
-        let mut bytes_received: u64 = 0;
-        let mut first_frame_logged = false;
-        let mut last_fps_report = Instant::now();
-
-        info!("UDP receiver thread listening on port {}...", local_udp_port);
-
-        while running_recv2.load(Ordering::Relaxed) {
-            match std_udp_socket.recv_from(&mut packet_buf) {
-                Ok((len, from)) => {
-                    bytes_received += len as u64;
-                    match receiver.push_datagram(&packet_buf[..len]) {
-                        Ok(Some((frame_data, _pts))) => {
-                            frames_received += 1;
-                            if !first_frame_logged {
-                                first_frame_logged = true;
-                                info!("🎉 First video frame assembled successfully ({} bytes) from {}!", frame_data.len(), from);
-                            }
-                            let _ = frame_tx.try_send(frame_data);
-                        }
-                        Ok(None) => {}
-                        Err(e) => {
-                            warn!("Packet error: {}", e);
-                        }
-                    }
-                }
-                Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut || e.kind() == std::io::ErrorKind::WouldBlock => {
-                    continue;
-                }
-                Err(e) => {
-                    error!("UDP socket receive error: {}", e);
-                    break;
-                }
+    {
+        // Tells the server where to send video and keeps NAT / firewall state alive.
+        let running = running.clone();
+        std::thread::spawn(move || {
+            while running.load(Ordering::Relaxed) {
+                let _ = udp.send_to(UDP_PUNCH, server_addr);
+                std::thread::sleep(Duration::from_millis(500));
             }
+        });
+    }
 
-            if last_fps_report.elapsed() >= std::time::Duration::from_secs(1) {
-                let mbps = (bytes_received as f64 * 8.0) / 1_000_000.0;
-                if frames_received > 0 {
-                    info!("Stream Stats: {} FPS, {:.2} Mbps", frames_received, mbps);
-                }
-                frames_received = 0;
-                bytes_received = 0;
-                last_fps_report = Instant::now();
+    {
+        // The server sends nothing after the handshake, so a read only returns when it goes away.
+        let (mut tcp, running) = (tcp.try_clone()?, running.clone());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 64];
+            while matches!(tcp.read(&mut buf), Ok(n) if n > 0) {}
+            if running.swap(false, Ordering::Relaxed) {
+                warn!("Server closed the connection");
             }
-        }
+        });
+    }
 
-        info!("UDP receiver thread terminated");
-    });
-
-    // 6. SDL3 Event & Presentation Loop
+    // 6. Event and presentation loop.
+    info!("Ctrl+Alt+G: grab keyboard | Ctrl+Alt+M: relative mouse | Ctrl+Alt+F: fullscreen | Ctrl+Alt+Q: quit");
     let mut event_pump = sdl.event_pump()?;
-    let mut grab_active = false;
+    let started = Instant::now();
+    let mut grab = false;
     let mut relative_mouse = false;
-    let mut has_received_frame = false;
-    let width = codec_params.width as usize;
-    let height = codec_params.height as usize;
-    let pitch = width * 4;
+    let mut fullscreen = args.fullscreen;
+    let mut have_frame = false;
+    let mut last_frame: Option<Vec<u8>> = None;
+    let mut redraw = true;
 
-    info!("Starting SDL3 viewer event loop. Press Ctrl+Alt+G to grab keyboard/mouse, Ctrl+Alt+M to toggle relative mouse.");
+    'main: while running.load(Ordering::Relaxed) {
+        if args.exit_after.is_some_and(|secs| started.elapsed().as_secs_f64() >= secs) {
+            break;
+        }
 
-    'main_loop: while running.load(Ordering::Relaxed) {
-        // Poll input events
+        let dst = letterbox(canvas.window().size(), (width, height));
+        // Window coordinates -> stream pixels.
+        let to_stream = |x: f32, y: f32| {
+            let sx = ((x - dst.x) / dst.w * width as f32).clamp(0.0, width as f32 - 1.0);
+            let sy = ((y - dst.y) / dst.h * height as f32).clamp(0.0, height as f32 - 1.0);
+            (sx as u16, sy as u16)
+        };
+
         for event in event_pump.poll_iter() {
-            use sdl3::event::Event;
-            use sdl3::keyboard::Keycode;
-
-            match event {
-                Event::Quit { .. } => break 'main_loop,
-                Event::KeyDown {
-                    keycode: Some(Keycode::G),
-                    keymod,
-                    ..
-                } if keymod.contains(sdl3::keyboard::Mod::LCTRLMOD) && keymod.contains(sdl3::keyboard::Mod::LALTMOD) => {
-                    grab_active = !grab_active;
-                    let _ = canvas.window_mut().set_keyboard_grab(grab_active);
-                    info!("Keyboard grab: {}", grab_active);
+            let input = match event {
+                Event::Quit { .. } => break 'main,
+                Event::Window { win_event: WindowEvent::Exposed | WindowEvent::Resized(..) | WindowEvent::PixelSizeChanged(..), .. } => {
+                    redraw = true;
+                    None
                 }
-                Event::KeyDown {
-                    keycode: Some(Keycode::M),
-                    keymod,
-                    ..
-                } if keymod.contains(sdl3::keyboard::Mod::LCTRLMOD) && keymod.contains(sdl3::keyboard::Mod::LALTMOD) => {
-                    relative_mouse = !relative_mouse;
-                    let _ = sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
-                    info!("Relative mouse mode: {}", relative_mouse);
-                }
-                Event::MouseMotion { xrel, yrel, x, y, .. } => {
-                    let input = if relative_mouse {
-                        InputEvent::MouseMoveRelative {
-                            dx: xrel as i16,
-                            dy: yrel as i16,
+                Event::KeyDown { keycode: Some(key), keymod, repeat: false, .. }
+                    if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
+                        && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD)
+                        && matches!(key, Keycode::G | Keycode::M | Keycode::F | Keycode::Q) =>
+                {
+                    match key {
+                        Keycode::G => {
+                            grab = !grab;
+                            canvas.window_mut().set_keyboard_grab(grab);
+                            info!("Keyboard grab: {}", grab);
                         }
-                    } else {
-                        InputEvent::MouseMoveAbsolute {
-                            x: x.max(0.0) as u16,
-                            y: y.max(0.0) as u16,
+                        Keycode::M => {
+                            relative_mouse = !relative_mouse;
+                            sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
+                            info!("Relative mouse: {}", relative_mouse);
                         }
-                    };
-                    let mut buf = [0u8; 16];
-                    if let Ok(len) = input.serialize(&mut buf) {
-                        let header = make_message_type(9, len as u32);
-                        let mut msg = [0u8; 20];
-                        byteorder::LittleEndian::write_u32(&mut msg[0..4], header);
-                        msg[4..4 + len].copy_from_slice(&buf[..len]);
-                        let _ = tcp_stream.write_all(&msg[..4 + len]);
+                        Keycode::F => {
+                            fullscreen = !fullscreen;
+                            let _ = canvas.window_mut().set_fullscreen(fullscreen);
+                        }
+                        _ => break 'main,
                     }
+                    None
                 }
-                Event::MouseButtonDown { mouse_btn, .. } => {
-                    let input = InputEvent::MouseButton {
-                        button: mouse_btn as u8,
-                        down: true,
-                    };
-                    let mut buf = [0u8; 16];
-                    if let Ok(len) = input.serialize(&mut buf) {
-                        let header = make_message_type(9, len as u32);
-                        let mut msg = [0u8; 20];
-                        byteorder::LittleEndian::write_u32(&mut msg[0..4], header);
-                        msg[4..4 + len].copy_from_slice(&buf[..len]);
-                        let _ = tcp_stream.write_all(&msg[..4 + len]);
-                    }
+                Event::KeyDown { scancode: Some(scancode), keymod, repeat: false, .. } => Some(InputEvent::KeyboardKey {
+                    scancode: scancode.to_i32() as u16,
+                    down: true,
+                    modifiers: keymod.bits(),
+                }),
+                Event::KeyUp { scancode: Some(scancode), keymod, .. } => Some(InputEvent::KeyboardKey {
+                    scancode: scancode.to_i32() as u16,
+                    down: false,
+                    modifiers: keymod.bits(),
+                }),
+                Event::MouseMotion { x, y, xrel, yrel, .. } => Some(if relative_mouse {
+                    InputEvent::MouseMoveRelative { dx: xrel as i16, dy: yrel as i16 }
+                } else {
+                    let (x, y) = to_stream(x, y);
+                    InputEvent::MouseMoveAbsolute { x, y }
+                }),
+                Event::MouseButtonDown { mouse_btn, .. } => Some(InputEvent::MouseButton { button: mouse_btn as u8, down: true }),
+                Event::MouseButtonUp { mouse_btn, .. } => Some(InputEvent::MouseButton { button: mouse_btn as u8, down: false }),
+                Event::MouseWheel { x, y, .. } => Some(InputEvent::MouseWheel { dx: (x * 120.0) as i16, dy: (y * 120.0) as i16 }),
+                _ => None,
+            };
+            if let Some(input) = input {
+                if !send_input(&mut tcp, input) {
+                    warn!("Lost the control connection");
+                    break 'main;
                 }
-                Event::MouseButtonUp { mouse_btn, .. } => {
-                    let input = InputEvent::MouseButton {
-                        button: mouse_btn as u8,
-                        down: false,
-                    };
-                    let mut buf = [0u8; 16];
-                    if let Ok(len) = input.serialize(&mut buf) {
-                        let header = make_message_type(9, len as u32);
-                        let mut msg = [0u8; 20];
-                        byteorder::LittleEndian::write_u32(&mut msg[0..4], header);
-                        msg[4..4 + len].copy_from_slice(&buf[..len]);
-                        let _ = tcp_stream.write_all(&msg[..4 + len]);
-                    }
-                }
-                _ => {}
             }
         }
 
-        // Check if a new video frame arrived
-        if let Ok(frame_data) = frame_rx.try_recv() {
-            has_received_frame = true;
-            // Update texture buffer if frame matches size, or stride
-            if frame_data.len() >= pitch * height {
-                let _ = texture.update(None, &frame_data[..pitch * height], pitch);
-            } else {
-                // If compressed wavelet / synthetic payload, update texture with pattern
-                let _ = texture.with_lock(None, |buffer: &mut [u8], _p: usize| {
-                    let fill_len = buffer.len().min(frame_data.len());
-                    buffer[..fill_len].copy_from_slice(&frame_data[..fill_len]);
-                });
+        // Wait briefly for the next frame; this also paces the loop while the stream is idle.
+        if let Ok(mut frame) = frame_rx.recv_timeout(Duration::from_millis(4)) {
+            // Only the newest frame is worth showing.
+            while let Ok(newer) = frame_rx.try_recv() {
+                let _ = recycle_tx.try_send(std::mem::replace(&mut frame, newer));
+            }
+            texture.update(None, &frame, width as usize * 4).context("texture upload failed")?;
+            have_frame = true;
+            redraw = true;
+            if let Some(old) = last_frame.replace(frame) {
+                let _ = recycle_tx.try_send(old);
             }
         }
 
-        // Render pass
-        if has_received_frame {
-            let _ = canvas.copy(&texture, None, None);
-        } else {
-            // Draw initial connected waiting screen so window maps and displays immediately on Wayland/Windows
-            canvas.set_draw_color(Color::RGB(18, 24, 38));
+        if redraw {
+            canvas.set_draw_color(if have_frame { Color::RGB(0, 0, 0) } else { Color::RGB(18, 24, 38) });
             canvas.clear();
-
-            // Draw a subtle animated connection indicator box in center
-            canvas.set_draw_color(Color::RGB(59, 130, 246));
-            let center_x = (codec_params.width as i32 / 2) - 100;
-            let center_y = (codec_params.height as i32 / 2) - 20;
-            let _ = canvas.fill_rect(Rect::new(center_x, center_y, 200, 40));
+            if have_frame {
+                canvas.copy(&texture, None, Some(dst))?;
+            }
+            canvas.present();
+            redraw = false;
         }
-
-        // Crucial for Wayland/Windows: Present backbuffer to display surface
-        canvas.present();
-
-        std::thread::sleep(std::time::Duration::from_millis(4));
     }
 
     running.store(false, Ordering::Relaxed);
-    let _ = recv_handle.join();
-    info!("PyroMirror Client shutdown cleanly");
+    let _ = tcp.shutdown(Shutdown::Both);
+    let _ = video_thread.join();
+
+    if let Some(path) = &args.dump_frame {
+        match &last_frame {
+            Some(frame) => {
+                let mut ppm = format!("P6\n{} {}\n255\n", width, height).into_bytes();
+                ppm.extend(frame.chunks_exact(4).flat_map(|px| [px[0], px[1], px[2]]));
+                std::fs::write(path, ppm).with_context(|| format!("could not write {}", path.display()))?;
+                info!("Wrote the last frame to {}", path.display());
+            }
+            None => bail!("no frame was received, nothing to dump"),
+        }
+    }
     Ok(())
 }

@@ -1,0 +1,4 @@
+# libpyrowave-shared is copied next to the binaries by pyrowave-sys/build.rs;
+# make the Linux binaries look for it there.
+[target.'cfg(target_os = "linux")']
+rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]

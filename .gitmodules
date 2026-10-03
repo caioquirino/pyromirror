@@ -1,0 +1,6 @@
+[submodule "submodules/pyrowave"]
+	path = submodules/pyrowave
+	url = https://github.com/Themaister/pyrowave.git
+[submodule "submodules/pyrofling"]
+	path = submodules/pyrofling
+	url = https://github.com/Themaister/pyrofling.git

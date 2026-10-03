@@ -39,6 +39,37 @@ pub fn message_get_length(v: u32) -> usize {
     (((v ^ PYRO_VERSION_MASK) >> 6) & 0xff) as usize
 }
 
+/// Largest payload a control message can carry (the length field is 8 bits).
+pub const MAX_MESSAGE_PAYLOAD: usize = 255;
+
+/// Writes one framed control message (4-byte header followed by the payload).
+pub fn write_message<W: std::io::Write>(w: &mut W, msg_type: u32, payload: &[u8]) -> std::io::Result<()> {
+    debug_assert!(payload.len() <= MAX_MESSAGE_PAYLOAD);
+    let mut msg = [0u8; 4 + MAX_MESSAGE_PAYLOAD];
+    LittleEndian::write_u32(&mut msg[0..4], make_message_type(msg_type, payload.len() as u32));
+    msg[4..4 + payload.len()].copy_from_slice(payload);
+    w.write_all(&msg[..4 + payload.len()])
+}
+
+/// Reads one framed control message into `payload`, returning its type and length.
+pub fn read_message<R: std::io::Read>(
+    r: &mut R,
+    payload: &mut [u8; MAX_MESSAGE_PAYLOAD],
+) -> std::io::Result<(u32, usize)> {
+    let mut header = [0u8; 4];
+    r.read_exact(&mut header)?;
+    let magic = LittleEndian::read_u32(&header);
+    if !validate_magic(magic) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            ProtoError::InvalidMagic(magic),
+        ));
+    }
+    let len = message_get_length(magic);
+    r.read_exact(&mut payload[..len])?;
+    Ok((message_get_type(magic), len))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
     pub udp_port: u16,

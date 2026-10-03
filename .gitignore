@@ -1,7 +1,6 @@
 /target
 /.deps
 **/*.rs.bk
-Cargo.lock
 
 # Build & CMake artifacts
 build/

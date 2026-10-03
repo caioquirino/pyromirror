@@ -1,11 +1,9 @@
 [package]
-name = "pyromirror-net"
+name = "pyromirror-codec"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
 [dependencies]
-pyromirror-proto = { path = "../pyromirror-proto" }
-socket2 = { workspace = true }
-log = { workspace = true }
+pyrowave-sys = { path = "../pyrowave-sys" }
 thiserror = { workspace = true }

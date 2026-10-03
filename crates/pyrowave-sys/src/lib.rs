@@ -1,27 +1,53 @@
-//! Pyrowave FFI bindings
+//! Raw FFI bindings to the PyroWave C API (`submodules/pyrowave/pyrowave.h`, API 0.6).
+//!
+//! Only the device, encoder and decoder entry points that work on CPU buffers are bound. The
+//! external-memory (zero-copy GPU) entry points take Vulkan types and are not bound yet.
 
 #![allow(non_camel_case_types)]
-#![allow(non_snake_case)]
-#![allow(non_upper_case_globals)]
 
 use std::os::raw::{c_int, c_void};
 
-pub type pyrowave_result = i32;
+pub const PYROWAVE_API_VERSION_MAJOR: u32 = 0;
+pub const PYROWAVE_API_VERSION_MINOR: u32 = 6;
+
+pub type pyrowave_result = c_int;
 pub const PYROWAVE_SUCCESS: pyrowave_result = 0;
 pub const PYROWAVE_TIMEOUT: pyrowave_result = 1;
 pub const PYROWAVE_ERROR_GENERIC: pyrowave_result = -1;
 pub const PYROWAVE_ERROR_INVALID_ARGUMENT: pyrowave_result = -2;
+pub const PYROWAVE_ERROR_OUT_OF_HOST_MEMORY: pyrowave_result = -3;
+pub const PYROWAVE_ERROR_OUT_OF_DEVICE_MEMORY: pyrowave_result = -4;
+pub const PYROWAVE_ERROR_NO_VULKAN: pyrowave_result = -5;
+pub const PYROWAVE_ERROR_NOT_IMPLEMENTED: pyrowave_result = -6;
+pub const PYROWAVE_ERROR_UNSUPPORTED_EXTERNAL_HANDLE: pyrowave_result = -7;
+pub const PYROWAVE_ERROR_FAILED_EXTERNAL_HANDLE: pyrowave_result = -8;
 
-pub type pyrowave_chroma_subsampling = u32;
+pub type pyrowave_chroma_subsampling = c_int;
 pub const PYROWAVE_CHROMA_SUBSAMPLING_420: pyrowave_chroma_subsampling = 0;
 pub const PYROWAVE_CHROMA_SUBSAMPLING_444: pyrowave_chroma_subsampling = 1;
 
-pub type pyrowave_encoder = *mut c_void;
-pub type pyrowave_decoder = *mut c_void;
-pub type pyrowave_device = *mut c_void;
-pub type pyrowave_sync_object = *mut c_void;
-pub type pyrowave_image = *mut c_void;
-pub type pyrowave_os_handle = usize;
+pub type pyrowave_cpu_buffer_format = c_int;
+/// 2 planes, encode only.
+pub const PYROWAVE_CPU_BUFFER_FORMAT_NV12: pyrowave_cpu_buffer_format = 0;
+pub const PYROWAVE_CPU_BUFFER_FORMAT_YUV420P: pyrowave_cpu_buffer_format = 1;
+pub const PYROWAVE_CPU_BUFFER_FORMAT_YUV444P: pyrowave_cpu_buffer_format = 2;
+
+#[repr(C)]
+pub struct pyrowave_encoder_opaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct pyrowave_decoder_opaque {
+    _private: [u8; 0],
+}
+#[repr(C)]
+pub struct pyrowave_device_opaque {
+    _private: [u8; 0],
+}
+
+pub type pyrowave_encoder = *mut pyrowave_encoder_opaque;
+pub type pyrowave_decoder = *mut pyrowave_decoder_opaque;
+pub type pyrowave_device = *mut pyrowave_device_opaque;
 
 #[repr(C)]
 #[derive(Debug, Copy, Clone)]
@@ -43,7 +69,7 @@ pub struct pyrowave_decoder_create_info {
 }
 
 #[repr(C)]
-#[derive(Debug, Copy, Clone)]
+#[derive(Debug, Copy, Clone, Default)]
 pub struct pyrowave_packet {
     pub offset: usize,
     pub size: usize,
@@ -55,8 +81,20 @@ pub struct pyrowave_rate_control {
     pub maximum_bitstream_size: usize,
 }
 
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct pyrowave_cpu_buffer {
+    pub data: [*mut c_void; 3],
+    pub row_stride_in_bytes: [usize; 3],
+    pub plane_size_in_bytes: [usize; 3],
+    pub width: c_int,
+    pub height: c_int,
+    pub format: pyrowave_cpu_buffer_format,
+}
+
 extern "C" {
     pub fn pyrowave_get_api_version(major: *mut u32, minor: *mut u32, patch: *mut u32);
+
     pub fn pyrowave_create_default_device(device: *mut pyrowave_device) -> pyrowave_result;
     pub fn pyrowave_device_destroy(device: pyrowave_device);
 
@@ -64,14 +102,16 @@ extern "C" {
         info: *const pyrowave_encoder_create_info,
         encoder: *mut pyrowave_encoder,
     ) -> pyrowave_result;
-    pub fn pyrowave_encoder_destroy(encoder: pyrowave_encoder);
-
+    pub fn pyrowave_encoder_encode_cpu_synchronous(
+        encoder: pyrowave_encoder,
+        buffers: *const pyrowave_cpu_buffer,
+        rate_control: *const pyrowave_rate_control,
+    ) -> pyrowave_result;
     pub fn pyrowave_encoder_compute_num_packets(
         encoder: pyrowave_encoder,
         packet_boundary: usize,
         num_packets: *mut usize,
     ) -> pyrowave_result;
-
     pub fn pyrowave_encoder_packetize(
         encoder: pyrowave_encoder,
         packets: *mut pyrowave_packet,
@@ -80,23 +120,23 @@ extern "C" {
         bitstream: *mut c_void,
         size: usize,
     ) -> pyrowave_result;
+    pub fn pyrowave_encoder_destroy(encoder: pyrowave_encoder);
 
+    pub fn pyrowave_decoder_device_prefers_fragment_path(device: pyrowave_device) -> bool;
     pub fn pyrowave_decoder_create(
         info: *const pyrowave_decoder_create_info,
         decoder: *mut pyrowave_decoder,
     ) -> pyrowave_result;
-    pub fn pyrowave_decoder_destroy(decoder: pyrowave_decoder);
-
+    pub fn pyrowave_decoder_clear(decoder: pyrowave_decoder);
     pub fn pyrowave_decoder_push_packet(
         decoder: pyrowave_decoder,
         data: *const c_void,
         size: usize,
     ) -> pyrowave_result;
-
-    pub fn pyrowave_decoder_decode_is_ready(
+    pub fn pyrowave_decoder_decode_is_ready(decoder: pyrowave_decoder, allow_partial_frame: bool) -> bool;
+    pub fn pyrowave_decoder_decode_cpu_buffer_synchronous(
         decoder: pyrowave_decoder,
-        allow_partial_frame: bool,
-    ) -> bool;
-
-    pub fn pyrowave_decoder_device_prefers_fragment_path(device: pyrowave_device) -> bool;
+        buffers: *const pyrowave_cpu_buffer,
+    ) -> pyrowave_result;
+    pub fn pyrowave_decoder_destroy(decoder: pyrowave_decoder);
 }

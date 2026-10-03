@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pyromirror-proto",
     "crates/pyrowave-sys",
+    "crates/pyromirror-codec",
     "crates/pyromirror-net",
     "crates/pyromirror-capture",
     "crates/pyromirror-server",
@@ -21,7 +22,6 @@ log = "0.4"
 env_logger = "0.11"
 clap = { version = "4.5", features = ["derive"] }
 byteorder = "1.5"
-tokio = { version = "1.40", features = ["full"] }
 socket2 = "0.5"
 crossbeam-channel = "0.5"
 sdl3 = "0.20"

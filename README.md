@@ -8,13 +8,30 @@ For deep technical architecture, performance targets, and design specifications,
 
 ---
 
+## Current Status
+
+What works today:
+
+* **Video, end to end:** desktop capture → PyroWave encode (Vulkan compute) → UDP → PyroWave decode → SDL3 window, on Windows and Linux, in 4:4:4 or 4:2:0.
+* **Capture backends:** DXGI Desktop Duplication on Windows; xdg-desktop-portal ScreenCast + PipeWire on Linux (Wayland, and X11 sessions on desktops that ship a portal backend).
+* **Loss handling:** every datagram carries one independently decodable PyroWave packet, so lost packets blur a few blocks of one frame instead of stalling the stream.
+
+Not implemented yet:
+
+* **Input injection.** The client sends mouse and keyboard events, but the server only logs them.
+* **Zero-copy capture.** Frames take a CPU round trip (colour conversion + upload) on both ends; the D3D11 shared-texture / DMA-BUF paths of PyroWave are not wired up yet.
+* **HDR.** With HDR enabled on Windows the capture is an SDR conversion that looks washed out.
+* **Mouse pointer on Windows** (Desktop Duplication delivers it separately), **audio**, **FEC**, **resolution changes while streaming**, and the **Android client**.
+
+---
+
 ## Supported Platforms
 
 | Platform | Host (Server) | Client (Viewer) | Architecture |
 | :--- | :---: | :---: | :--- |
 | **Windows 10 / 11** | ✅ | ✅ | `x86_64` |
 | **Linux (Wayland)** | ✅ | ✅ | `x86_64`, `aarch64` |
-| **Android 10+** | Planned | 🚧 (In Progress) | `arm64-v8a` |
+| **Android 10+** | Planned | Planned | `arm64-v8a` |
 
 ---
 
@@ -72,7 +89,7 @@ sudo dnf install -y \
 
 ### Windows (10 / 11)
 1. Install **Visual Studio 2022** (Desktop development with C++ workload enabled) or [Build Tools for Visual Studio](https://visualstudio.microsoft.com/downloads/).
-2. Install the **[Vulkan SDK](https://vulkan.lunarg.com/)** (v1.3.260 or newer).
+2. Install **Git for Windows** (the build clones PyroWave's Granite dependency). A Vulkan SDK is not needed; up-to-date GPU drivers provide the Vulkan runtime.
 3. Install **CMake** and **Ninja** via `winget`:
    ```powershell
    winget install Kitware.CMake Ninja-build.Ninja
@@ -111,23 +128,17 @@ cd pyromirror
 
 *(If you already cloned without submodules, run `git submodule update --init --recursive`)*.
 
-### 2. Fetch PyroWave Granite Dependencies
-PyroWave requires a small portion of the Granite framework for Vulkan memory management and Volk loaders:
-```bash
-cd submodules/pyrowave
-bash checkout_granite.sh
-cd ../..
-```
-
-### 3. Build PyroMirror (Host & Client)
+### 2. Build PyroMirror (Host & Client)
 ```bash
 # Build release binaries with optimizations
 cargo build --release
 ```
 
+The first build clones the Granite revision PyroWave is pinned to (into `submodules/pyrowave/Granite`, so it needs `git` and network access) and compiles PyroWave with CMake. `libpyrowave-shared` is copied next to the binaries; keep it there when moving them elsewhere.
+
 Binaries will be placed in `target/release/`:
-* `pyromirror-server`: The streaming host daemon (screen & audio capture, encoder, input receiver).
-* `pyromirror-client`: The viewer application (SDL3 window, decoder, audio playback, input capture).
+* `pyromirror-server`: The streaming host (screen capture, encoder).
+* `pyromirror-client`: The viewer (SDL3 window, decoder, input capture).
 
 ---
 
@@ -151,7 +162,7 @@ Ready-to-use scripts are located in `scripts/`:
   ```bash
   ./scripts/build_windows_cross.sh
   ```
-  Produces `target/x86_64-pc-windows-gnu/release/pyromirror-client.exe`.
+  Produces `pyromirror-server.exe`, `pyromirror-client.exe` and the DLLs they need in `target/x86_64-pc-windows-gnu/release/`; copy that set of files to the Windows machine.
 
 * **Windows x86_64 (Native MSVC on Windows machine):**
   ```cmd
@@ -178,24 +189,33 @@ cargo run --release --bin pyromirror-server -- \
 ```
 
 #### Server Command-Line Options:
-* `--port <PORT>`: Base port for TCP control and UDP video streaming (default: `9000`).
-* `--bitrate-mbps <MBPS>`: Target PyroWave bitrate in Mbps (default: `250`).
-* `--chroma <420|444>`: Chroma subsampling mode (default: `444` for sharp text; `420` for bandwidth saving).
-* `--fps <FPS>`: Target framerate (e.g. `60`, `120`, `144`).
-* `--mtu <BYTES>`: Network MTU (default: `1400` for standard Ethernet; `8900` for Jumbo frames).
+* `--bind <ADDR>`: Address to listen on (default: `0.0.0.0`).
+* `--port <PORT>`: Port for TCP control and UDP video (default: `9000`).
+* `--bitrate-mbps <MBPS>`: Video bitrate in Mbps; each frame is capped to bitrate / fps (default: `250`).
+* `--chroma <420|444>`: Chroma subsampling (default: `444` for sharp text; `420` saves bandwidth).
+* `--fps <FPS>`: Maximum framerate (default: `60`).
+* `--mtu <BYTES>`: UDP datagram size (default: `1400` for standard Ethernet; `8900` for jumbo frames).
+* `--monitor <INDEX>`: Windows only, monitor to capture (default: primary). On Linux the portal dialog picks the monitor.
+* `--test-pattern <WxH>`: Stream a generated pattern instead of the desktop, to test codec and network without capture.
+
+The stream always has the resolution of the captured monitor. Set `RUST_LOG=debug` on either side for per-second fps / bitrate / timing statistics.
+
+On Linux the first start shows your desktop's screen sharing dialog. The choice is remembered in `~/.local/state/pyromirror/screencast-restore-token`; delete that file to be asked again.
+
+On Windows, allow the server through the firewall when prompted (TCP and UDP on the chosen port).
 
 ### 2. Starting the Client (Viewer)
 
 ```bash
-# Connect to the host IP
+# Connect to the host (the port defaults to 9000)
 cargo run --release --bin pyromirror-client -- pyro://192.168.1.100:9000
 ```
 
 #### Viewer Controls:
-* **`Ctrl + Alt + G`**: Toggle Keyboard & Mouse Grab (captures `Alt+Tab`, `Windows/Super` key for remote host).
-* **`Ctrl + Alt + F`**: Toggle Fullscreen.
-* **`Ctrl + Alt + M`**: Toggle between **Desktop Mode** (absolute cursor) and **Immersive / Game Mode** (relative mouse lock).
-* **`F11`**: Toggle Performance Overlay HUD (latency, bitrate, FPS, packet loss).
+* **`Ctrl + Alt + G`**: Toggle keyboard grab (so `Alt+Tab`, `Super` etc. reach the viewer).
+* **`Ctrl + Alt + F`**: Toggle fullscreen.
+* **`Ctrl + Alt + M`**: Toggle relative mouse mode.
+* **`Ctrl + Alt + Q`**: Quit.
 
 ---
 

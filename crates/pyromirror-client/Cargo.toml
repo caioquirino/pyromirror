@@ -7,11 +7,15 @@ license.workspace = true
 [dependencies]
 pyromirror-proto = { path = "../pyromirror-proto" }
 pyromirror-net = { path = "../pyromirror-net" }
-pyrowave-sys = { path = "../pyrowave-sys" }
+pyromirror-codec = { path = "../pyromirror-codec" }
 crossbeam-channel = { workspace = true }
-byteorder = { workspace = true }
 clap = { workspace = true }
 log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }
 sdl3 = { workspace = true }
+
+# MSVC has no system SDL3 to link against; build it from source there. MinGW cross builds use the
+# prebuilt SDL3 development package fetched by scripts/build_windows_cross.sh.
+[target.'cfg(all(windows, target_env = "msvc"))'.dependencies]
+sdl3 = { workspace = true, features = ["build-from-source-static"] }
