@@ -1,0 +1,19 @@
+/target
+/.deps
+**/*.rs.bk
+Cargo.lock
+
+# Build & CMake artifacts
+build/
+build-*/
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+
+# Editor and IDE
+.idea/
+.vscode/
+*.swp
+*~

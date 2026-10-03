@@ -1,0 +1,9 @@
+[package]
+name = "pyromirror-proto"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+byteorder = { workspace = true }
+thiserror = { workspace = true }

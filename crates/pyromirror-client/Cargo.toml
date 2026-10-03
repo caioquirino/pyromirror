@@ -1,0 +1,17 @@
+[package]
+name = "pyromirror-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+pyromirror-proto = { path = "../pyromirror-proto" }
+pyromirror-net = { path = "../pyromirror-net" }
+pyrowave-sys = { path = "../pyrowave-sys" }
+crossbeam-channel = { workspace = true }
+byteorder = { workspace = true }
+clap = { workspace = true }
+log = { workspace = true }
+env_logger = { workspace = true }
+anyhow = { workspace = true }
+sdl3 = { workspace = true }

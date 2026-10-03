@@ -1,0 +1,4 @@
+[tools]
+cmake = "latest"
+ninja = "latest"
+rust = "latest"
