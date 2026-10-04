@@ -11,6 +11,14 @@ use log::{debug, error, info, warn};
 use pyromirror_codec::{Decoder, PixelFormat};
 use pyromirror_net::{frame_seq_is_newer, parse_datagram, Packet};
 
+/// A decoded picture, on its way to the window.
+pub enum Frame {
+    /// RGBA pixels, to upload.
+    Pixels(Vec<u8>),
+    /// The picture is in this set of GPU textures already (see `gpu_present`).
+    Target(usize),
+}
+
 #[derive(Default)]
 struct Stats {
     frames: u32,
@@ -19,9 +27,11 @@ struct Stats {
     audio_packets: u32,
     bytes: usize,
     decode: Duration,
+    /// Frames that never left the GPU.
+    on_gpu: u32,
 }
 
-/// Feeds datagrams to the decoder and sends finished RGBA frames to the render thread.
+/// Feeds datagrams to the decoder and sends finished frames to the render thread.
 ///
 /// A frame is decoded as soon as PyroWave reports it complete. If the next frame starts arriving
 /// first, packets were lost: the incomplete frame is still decoded if enough of it is there
@@ -31,7 +41,7 @@ pub fn receive_loop(
     mut decoder: Decoder,
     width: u32,
     height: u32,
-    frames: Sender<Vec<u8>>,
+    frames: Sender<Frame>,
     recycled: Receiver<Vec<u8>>,
     audio: Option<Sender<Vec<i16>>>,
     summary: Arc<Mutex<String>>,
@@ -49,16 +59,37 @@ pub fn receive_loop(
     let mut stats = Stats::default();
     let mut last_report = Instant::now();
     let mut first_frame = true;
+    // Which set of GPU textures the next frame goes into, while there are any.
+    let mut next_target = 0;
 
     let mut decode = |decoder: &mut Decoder, stats: &mut Stats, partial: bool| {
-        let mut buffer = recycled.try_recv().unwrap_or_default();
-        buffer.resize(frame_len, 0);
-
         let start = Instant::now();
-        if let Err(e) = decoder.decode(&mut buffer, stride, PixelFormat::Rgbx) {
-            warn!("Decode failed: {}", e);
-            return;
+        let mut frame = None;
+        if decoder.gpu_targets() > 0 {
+            match decoder.decode_to_target(next_target) {
+                Ok(()) => {
+                    frame = Some(Frame::Target(next_target));
+                    next_target = (next_target + 1) % decoder.gpu_targets();
+                }
+                Err(e) => {
+                    warn!("Zero-copy display failed ({}); converting frames on the CPU instead", e);
+                    decoder.drop_gpu_targets();
+                }
+            }
         }
+        let frame = match frame {
+            Some(frame) => frame,
+            None => {
+                let mut buffer = recycled.try_recv().unwrap_or_default();
+                buffer.resize(frame_len, 0);
+                if let Err(e) = decoder.decode(&mut buffer, stride, PixelFormat::Rgbx) {
+                    warn!("Decode failed: {}", e);
+                    return;
+                }
+                Frame::Pixels(buffer)
+            }
+        };
+        stats.on_gpu += matches!(frame, Frame::Target(_)) as u32;
         stats.decode += start.elapsed();
         stats.frames += 1;
         stats.partial += partial as u32;
@@ -67,7 +98,7 @@ pub fn receive_loop(
             info!("First frame decoded in {:.1} ms", start.elapsed().as_secs_f64() * 1000.0);
         }
 
-        match frames.try_send(buffer) {
+        match frames.try_send(frame) {
             Ok(()) | Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => running.store(false, Ordering::Relaxed),
         }
@@ -144,10 +175,11 @@ pub fn receive_loop(
             if stats.frames > 0 || stats.skipped > 0 {
                 let log_degraded = stats.partial > 0 || stats.skipped > 0;
                 let message = format!(
-                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode+convert per frame, {} partial, {} skipped, {} audio packets",
+                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode per frame ({}), {} partial, {} skipped, {} audio packets",
                     stats.frames as f64 / elapsed.as_secs_f64(),
                     stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
                     stats.decode.as_secs_f64() * 1000.0 / stats.frames.max(1) as f64,
+                    if stats.on_gpu > 0 { "zero-copy" } else { "read back, converted on the CPU" },
                     stats.partial,
                     stats.skipped,
                     stats.audio_packets

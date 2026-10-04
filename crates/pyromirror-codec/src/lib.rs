@@ -192,16 +192,19 @@ pub struct Encoder {
     device: Arc<Device>,
 }
 
-struct Texture {
-    raw: *mut sys::pm_gpu_image,
-    /// Same size as the encoder, so no scaling is needed.
-    exact_size: bool,
+/// A texture of another graphics API, imported into PyroWave's device.
+struct GpuImage(*mut sys::pm_gpu_image);
+
+impl Drop for GpuImage {
+    fn drop(&mut self) {
+        unsafe { sys::pm_gpu_image_destroy(self.0) };
+    }
 }
 
-impl Drop for Texture {
-    fn drop(&mut self) {
-        unsafe { sys::pm_gpu_image_destroy(self.raw) };
-    }
+struct Texture {
+    image: GpuImage,
+    /// Same size as the encoder, so no scaling is needed.
+    exact_size: bool,
 }
 
 /// What kind of OS handle `Encoder::import_texture` is given.
@@ -248,10 +251,10 @@ impl Encoder {
         };
         let mut raw = std::ptr::null_mut();
         check("image_create", unsafe {
-            sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, format, &mut raw)
+            sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, format, false, &mut raw)
         })?;
         let exact_size = width as usize == self.planes.width && height as usize == self.planes.height;
-        self.texture = Some(Texture { raw, exact_size });
+        self.texture = Some(Texture { image: GpuImage(raw), exact_size });
         Ok(())
     }
 
@@ -274,7 +277,7 @@ impl Encoder {
         };
         let max_frame_bytes = Self::frame_budget(max_frame_bytes);
         check("encoder_encode_gpu_scaled_synchronous", unsafe {
-            sys::pm_gpu_image_encode(self.raw, texture.raw, texture.exact_size, max_frame_bytes)
+            sys::pm_gpu_image_encode(self.raw, texture.image.0, texture.exact_size, max_frame_bytes)
         })?;
         self.last_from_texture = true;
         self.packetize(max_frame_bytes, packet_boundary)
@@ -411,7 +414,23 @@ impl<'a> Packets<'a> {
 pub struct Decoder {
     raw: sys::pyrowave_decoder,
     planes: Planes,
-    _device: Arc<Device>,
+    /// Sets of Y, Cb, Cr textures owned by whatever draws the picture, to decode into without
+    /// the pixels passing through memory.
+    targets: Vec<[GpuImage; 3]>,
+    fence: Option<Fence>,
+    device: Arc<Device>,
+}
+
+/// The other API's fence, through which it learns that a decode has finished.
+struct Fence {
+    raw: *mut sys::pm_gpu_fence,
+    value: u64,
+}
+
+impl Drop for Fence {
+    fn drop(&mut self) {
+        unsafe { sys::pm_gpu_fence_destroy(self.raw) };
+    }
 }
 
 unsafe impl Send for Decoder {}
@@ -436,7 +455,68 @@ impl Decoder {
         };
         let mut raw = std::ptr::null_mut();
         check("decoder_create", unsafe { sys::pyrowave_decoder_create(&info, &mut raw) })?;
-        Ok(Self { raw, planes, _device: device })
+        Ok(Self { raw, planes, targets: Vec::new(), fence: None, device })
+    }
+
+    /// The sizes of the Y, Cb and Cr planes, which is what textures for `add_gpu_target` must
+    /// have (single channel, 8 bits).
+    pub fn plane_sizes(&self) -> [(u32, u32); 3] {
+        let luma = (self.planes.width as u32, self.planes.height as u32);
+        let chroma = match self.planes.chroma {
+            Chroma::C420 => (luma.0 / 2, luma.1 / 2),
+            Chroma::C444 => luma,
+        };
+        [luma, chroma, chroma]
+    }
+
+    /// Imports the fence of the API that owns the target textures (Windows: the NT handle of a
+    /// shared `ID3D11Fence`). The handle is consumed.
+    pub fn set_gpu_fence(&mut self, handle: usize) -> Result<(), CodecError> {
+        self.fence = None;
+        let mut raw = std::ptr::null_mut();
+        check("sync_object_create", unsafe { sys::pm_gpu_fence_import(self.device.raw, handle, &mut raw) })?;
+        self.fence = Some(Fence { raw, value: 0 });
+        Ok(())
+    }
+
+    /// Imports three textures (Y, Cb, Cr; see `plane_sizes`) as something to decode into, and
+    /// returns the set's index for `decode_to_target`. The handles are consumed.
+    pub fn add_gpu_target(&mut self, planes: [TextureHandle; 3]) -> Result<usize, CodecError> {
+        let sizes = self.plane_sizes();
+        let mut images = Vec::with_capacity(3);
+        for (TextureHandle::D3d11(handle), (width, height)) in planes.into_iter().zip(sizes) {
+            let mut raw = std::ptr::null_mut();
+            check("image_create", unsafe {
+                sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, sys::PM_FORMAT_R8, true, &mut raw)
+            })?;
+            images.push(GpuImage(raw));
+        }
+        let Ok(set) = <[GpuImage; 3]>::try_from(images) else { unreachable!("three planes were imported") };
+        self.targets.push(set);
+        Ok(self.targets.len() - 1)
+    }
+
+    pub fn gpu_targets(&self) -> usize {
+        self.targets.len()
+    }
+
+    /// Stops using the imported textures.
+    pub fn drop_gpu_targets(&mut self) {
+        self.targets.clear();
+        self.fence = None;
+    }
+
+    /// Decodes the queued packets into a set of imported textures and waits until they are
+    /// written. Their owner may draw from them afterwards, until they are decoded into again.
+    pub fn decode_to_target(&mut self, index: usize) -> Result<(), CodecError> {
+        let invalid = CodecError::Call { call: "decode_to_target (no such target)", code: sys::PYROWAVE_ERROR_INVALID_ARGUMENT };
+        let (Some(target), Some(fence)) = (self.targets.get(index), self.fence.as_mut()) else { return Err(invalid) };
+        let planes = [target[0].0, target[1].0, target[2].0];
+        fence.value += 1;
+        // A decode takes a millisecond or two; a second means the GPU is gone.
+        check("decoder_decode_gpu_buffer", unsafe {
+            sys::pm_gpu_decode(self.raw, planes.as_ptr(), fence.raw, fence.value, 1_000_000_000)
+        })
     }
 
     /// Drops all queued packets.
@@ -474,6 +554,8 @@ impl Decoder {
 
 impl Drop for Decoder {
     fn drop(&mut self) {
+        // What belongs to the device goes before the decoder that used it.
+        self.drop_gpu_targets();
         unsafe { sys::pyrowave_decoder_destroy(self.raw) };
     }
 }

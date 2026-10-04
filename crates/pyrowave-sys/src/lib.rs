@@ -104,6 +104,13 @@ pub const PM_HANDLE_D3D11_TEXTURE: c_int = 0;
 pub const PM_FORMAT_BGRA8: c_int = 0;
 pub const PM_FORMAT_RGBA8: c_int = 1;
 pub const PM_FORMAT_RGBA16F: c_int = 2;
+pub const PM_FORMAT_R8: c_int = 3;
+
+/// An imported fence of another graphics API (see `glue.c`).
+#[repr(C)]
+pub struct pm_gpu_fence {
+    _private: [u8; 0],
+}
 
 extern "C" {
     pub fn pm_create_device_for_luid(luid: *const u8, device: *mut pyrowave_device) -> pyrowave_result;
@@ -114,7 +121,17 @@ extern "C" {
         width: u32,
         height: u32,
         format: c_int,
+        writable: bool,
         out: *mut *mut pm_gpu_image,
+    ) -> pyrowave_result;
+    pub fn pm_gpu_fence_import(device: pyrowave_device, handle: usize, out: *mut *mut pm_gpu_fence) -> pyrowave_result;
+    pub fn pm_gpu_fence_destroy(fence: *mut pm_gpu_fence);
+    pub fn pm_gpu_decode(
+        decoder: pyrowave_decoder,
+        planes: *const *mut pm_gpu_image,
+        fence: *mut pm_gpu_fence,
+        value: u64,
+        timeout_ns: u64,
     ) -> pyrowave_result;
     pub fn pm_gpu_image_encode(
         encoder: pyrowave_encoder,

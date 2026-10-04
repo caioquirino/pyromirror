@@ -14,6 +14,7 @@
 #define PM_FORMAT_BGRA8 0
 #define PM_FORMAT_RGBA8 1
 #define PM_FORMAT_RGBA16F 2
+#define PM_FORMAT_R8 3
 
 typedef struct pm_gpu_image
 {
@@ -32,7 +33,8 @@ pyrowave_result pm_create_device_for_luid(const uint8_t *luid, pyrowave_device *
 // PyroWave takes ownership of `handle` when the import succeeds. Callers treat it as consumed
 // either way and never use it again.
 pyrowave_result pm_gpu_image_import(pyrowave_device device, uintptr_t handle, int handle_kind,
-                                    uint32_t width, uint32_t height, int format, pm_gpu_image **out)
+                                    uint32_t width, uint32_t height, int format, bool writable,
+                                    pm_gpu_image **out)
 {
 	VkImageCreateInfo image_info;
 	memset(&image_info, 0, sizeof(image_info));
@@ -49,6 +51,9 @@ pyrowave_result pm_gpu_image_import(pyrowave_device device, uintptr_t handle, in
 	// As in PyroWave's own D3D11 interop test; the usage flags matter little for an import.
 	image_info.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
 	image_info.usage = VK_IMAGE_USAGE_SAMPLED_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
+	// The decoder writes its planes as storage images.
+	if (writable)
+		image_info.usage |= VK_IMAGE_USAGE_STORAGE_BIT;
 
 	switch (format)
 	{
@@ -60,6 +65,9 @@ pyrowave_result pm_gpu_image_import(pyrowave_device device, uintptr_t handle, in
 		break;
 	case PM_FORMAT_RGBA16F:
 		image_info.format = VK_FORMAT_R16G16B16A16_SFLOAT;
+		break;
+	case PM_FORMAT_R8:
+		image_info.format = VK_FORMAT_R8_UNORM;
 		break;
 	default:
 		return PYROWAVE_ERROR_INVALID_ARGUMENT;
@@ -87,7 +95,8 @@ pyrowave_result pm_gpu_image_import(pyrowave_device device, uintptr_t handle, in
 	if (result == PYROWAVE_SUCCESS)
 	{
 		result = pyrowave_image_get_image_view(img->image, VK_IMAGE_ASPECT_COLOR_BIT,
-		                                       VK_IMAGE_USAGE_SAMPLED_BIT, &img->view);
+		                                       writable ? VK_IMAGE_USAGE_STORAGE_BIT : VK_IMAGE_USAGE_SAMPLED_BIT,
+		                                       &img->view);
 		if (result != PYROWAVE_SUCCESS)
 			pyrowave_image_destroy(img->image);
 	}
@@ -144,4 +153,78 @@ void pm_gpu_image_destroy(pm_gpu_image *image)
 		return;
 	pyrowave_image_destroy(image->image);
 	free(image);
+}
+
+// A fence of another graphics API (Windows: the NT handle of a shared ID3D11Fence or
+// ID3D12Fence), which PyroWave signals when it has finished writing textures of that API.
+typedef struct pm_gpu_fence
+{
+	pyrowave_sync_object sync;
+} pm_gpu_fence;
+
+// PyroWave takes ownership of `handle` when the import succeeds.
+pyrowave_result pm_gpu_fence_import(pyrowave_device device, uintptr_t handle, pm_gpu_fence **out)
+{
+	pyrowave_sync_object_create_info info;
+	memset(&info, 0, sizeof(info));
+	info.device = device;
+	info.external_handle = (pyrowave_os_handle)handle;
+	// A D3D11 fence is the same thing as a D3D12 fence on Windows 10 and later.
+	info.handle_type = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+	info.semaphore_type = VK_SEMAPHORE_TYPE_TIMELINE;
+
+	pm_gpu_fence *fence = calloc(1, sizeof(*fence));
+	if (!fence)
+		return PYROWAVE_ERROR_OUT_OF_HOST_MEMORY;
+	pyrowave_result result = pyrowave_sync_object_create(&info, &fence->sync);
+	if (result != PYROWAVE_SUCCESS)
+	{
+		free(fence);
+		return result;
+	}
+	*out = fence;
+	return PYROWAVE_SUCCESS;
+}
+
+void pm_gpu_fence_destroy(pm_gpu_fence *fence)
+{
+	if (!fence)
+		return;
+	pyrowave_sync_object_destroy(fence->sync);
+	free(fence);
+}
+
+// Decodes the queued frame into three imported planes (Y, Cb, Cr) and waits until the GPU has
+// written them, by way of `fence` reaching `value` (which must grow with every call). After
+// that the planes' owner may read them.
+pyrowave_result pm_gpu_decode(pyrowave_decoder decoder, pm_gpu_image *const *planes, pm_gpu_fence *fence,
+                              uint64_t value, uint64_t timeout_ns)
+{
+	pyrowave_gpu_external_reference acquire_refs[3], release_refs[3];
+	pyrowave_gpu_buffers buffers;
+	memset(&buffers, 0, sizeof(buffers));
+	for (int i = 0; i < 3; i++)
+	{
+		// What the planes held before does not matter.
+		acquire_refs[i].image = planes[i]->image;
+		acquire_refs[i].queue_family_index = VK_QUEUE_FAMILY_IGNORED;
+		release_refs[i].image = planes[i]->image;
+		release_refs[i].queue_family_index = VK_QUEUE_FAMILY_EXTERNAL;
+		buffers.planes[i] = planes[i]->view;
+	}
+
+	pyrowave_gpu_sync_operation acquire, release;
+	memset(&acquire, 0, sizeof(acquire));
+	memset(&release, 0, sizeof(release));
+	acquire.images = acquire_refs;
+	acquire.num_images = 3;
+	release.images = release_refs;
+	release.num_images = 3;
+	release.sync.semaphore = pyrowave_sync_object_get_semaphore(fence->sync);
+	release.sync.value = value;
+
+	pyrowave_result result = pyrowave_decoder_decode_gpu_buffer(decoder, &acquire, &release, &buffers);
+	if (result != PYROWAVE_SUCCESS)
+		return result;
+	return pyrowave_sync_object_cpu_wait(fence->sync, value, timeout_ns);
 }

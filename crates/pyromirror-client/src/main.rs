@@ -4,6 +4,8 @@
 //! window. Mouse and keyboard events go back to the server over the TCP control connection.
 
 mod pointer;
+#[cfg(windows)]
+mod gpu_present;
 mod toolbar;
 mod video;
 
@@ -46,6 +48,11 @@ struct Args {
     /// Decode with fragment shaders instead of compute (meant for mobile / weak integrated GPUs)
     #[arg(long)]
     force_fragment: bool,
+
+    /// Read decoded frames back from the GPU and convert them on the CPU, as older versions
+    /// did, instead of decoding straight into the window's textures
+    #[arg(long)]
+    no_zero_copy: bool,
 
     /// Start in fullscreen mode
     #[arg(short, long)]
@@ -120,6 +127,29 @@ fn save_toolbar_position(position: f32) {
         if let Err(err) = std::fs::write(&path, format!("{position:.4}\n")) {
             warn!("Could not remember the menu position in {}: {}", path.display(), err);
         }
+    }
+}
+
+/// What putting decoded frames on screen costs, for the log.
+#[derive(Default)]
+struct ShowStats {
+    since: Option<Instant>,
+    frames: u32,
+    upload: Duration,
+    present: Duration,
+}
+
+impl ShowStats {
+    fn report(&mut self) {
+        let since = *self.since.get_or_insert_with(Instant::now);
+        if since.elapsed() < Duration::from_secs(2) {
+            return;
+        }
+        if self.frames > 0 {
+            let per_frame = |total: Duration| total.as_secs_f64() * 1000.0 / self.frames as f64;
+            log::debug!("per frame: {:.2} ms upload + {:.2} ms present", per_frame(self.upload), per_frame(self.present));
+        }
+        *self = Self { since: Some(Instant::now()), ..Default::default() };
     }
 }
 
@@ -223,13 +253,7 @@ fn main() -> anyhow::Result<()> {
     let (width, height) = (params.width as u32, params.height as u32);
     info!("Stream: {}x{} @ {} fps, chroma {:?}; receiving on UDP port {}", width, height, params.frame_rate_num, chroma, local_udp_port);
 
-    // 3. Decoder.
-    let device = Device::new().context("could not initialise PyroWave")?;
-    let fragment_path = args.force_fragment || device.prefers_fragment_decode();
-    let decoder = Decoder::new(device, width, height, chroma, fragment_path)
-        .context("could not create the PyroWave decoder")?;
-
-    // 4. Window.
+    // 3. Window.
     let sdl = sdl3::init()?;
     let video_subsystem = sdl.video()?;
 
@@ -254,6 +278,46 @@ fn main() -> anyhow::Result<()> {
     let mut texture = texture_creator
         .create_texture_streaming(PixelFormat::RGBA32, width, height)
         .context("could not create the video texture")?;
+
+    // 4. Decoder. On the graphics adapter the window is drawn with where that is known, so the
+    // picture can stay on it. (Dumping a frame to a file needs the pixels in memory.)
+    #[cfg(windows)]
+    let display_adapter = if args.no_zero_copy || args.dump_frame.is_some() { None } else { gpu_present::adapter(&canvas) };
+    #[cfg(not(windows))]
+    let display_adapter: Option<[u8; 8]> = None;
+    let (device, same_adapter) = match display_adapter.map(Device::on_adapter) {
+        Some(Ok(device)) => {
+            let usable = device.supports_texture_import();
+            (device, usable)
+        }
+        _ => (Device::new().context("could not initialise PyroWave")?, false),
+    };
+    let fragment_path = args.force_fragment || device.prefers_fragment_decode();
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut decoder = Decoder::new(device, width, height, chroma, fragment_path)
+        .context("could not create the PyroWave decoder")?;
+
+    // Textures the decoder writes and the window draws, if the two can share them.
+    #[cfg(windows)]
+    let gpu_targets = if same_adapter && !fragment_path {
+        match gpu_present::create(&canvas, &texture_creator, &mut decoder) {
+            Ok(targets) => {
+                info!("Zero-copy display: decoding straight into the window's textures");
+                Some(targets)
+            }
+            Err(e) => {
+                warn!("Zero-copy display is not available ({:#}); converting frames on the CPU", e);
+                decoder.drop_gpu_targets();
+                None
+            }
+        }
+    } else {
+        None
+    };
+    #[cfg(not(windows))]
+    let _ = same_adapter;
+    // Which set of those holds the picture to show, when it is not in `texture`.
+    let mut shown_target: Option<usize> = None;
 
     // Audio: packets are queued into an SDL stream, which resamples to whatever the device wants.
     let audio_rate = params.audio_sample_rate as usize;
@@ -292,7 +356,7 @@ fn main() -> anyhow::Result<()> {
 
     // 5. Background threads: video receive/decode, UDP keepalive, control-channel watchdog.
     let running = Arc::new(AtomicBool::new(true));
-    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
+    let (frame_tx, frame_rx) = crossbeam_channel::bounded::<video::Frame>(2);
     let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
     let summary = Arc::new(Mutex::new(String::new()));
@@ -370,6 +434,7 @@ fn main() -> anyhow::Result<()> {
     let mut pointer: Option<(f32, f32)> = None;
     // A press that landed on the toolbar; its release must not reach the remote desktop either.
     let mut toolbar_press = false;
+    let mut shown = ShowStats::default();
     // Lets the tray menu switch the same things as the menu in this window.
     let mut control = control::Listener::new(Side::Viewer);
     // What the host was last told is switched on, for its tray menu.
@@ -537,14 +602,25 @@ fn main() -> anyhow::Result<()> {
         if let Ok(mut frame) = frame_rx.recv_timeout(Duration::from_millis(4)) {
             // Only the newest frame is worth showing.
             while let Ok(newer) = frame_rx.try_recv() {
-                let _ = recycle_tx.try_send(std::mem::replace(&mut frame, newer));
+                if let video::Frame::Pixels(old) = std::mem::replace(&mut frame, newer) {
+                    let _ = recycle_tx.try_send(old);
+                }
             }
-            texture.update(None, &frame, width as usize * 4).context("texture upload failed")?;
+            match frame {
+                video::Frame::Pixels(pixels) => {
+                    let upload_start = Instant::now();
+                    texture.update(None, &pixels, width as usize * 4).context("texture upload failed")?;
+                    shown.upload += upload_start.elapsed();
+                    shown_target = None;
+                    if let Some(old) = last_frame.replace(pixels) {
+                        let _ = recycle_tx.try_send(old);
+                    }
+                }
+                video::Frame::Target(index) => shown_target = Some(index),
+            }
+            shown.frames += 1;
             have_frame = true;
             redraw = true;
-            if let Some(old) = last_frame.replace(frame) {
-                let _ = recycle_tx.try_send(old);
-            }
         }
 
         if toolbar.update(if relative_mouse { None } else { pointer }, window_width, &stats) {
@@ -565,13 +641,23 @@ fn main() -> anyhow::Result<()> {
             canvas.set_draw_color(if have_frame { Color::RGB(0, 0, 0) } else { Color::RGB(18, 24, 38) });
             canvas.clear();
             if have_frame {
-                canvas.copy(&texture, None, Some(dst))?;
-            }
+                    #[cfg(windows)]
+                    let picture = match (shown_target, &gpu_targets) {
+                        (Some(index), Some(targets)) => &targets.textures[index],
+                        _ => &texture,
+                    };
+                    #[cfg(not(windows))]
+                    let picture = (&texture, shown_target).0;
+                    canvas.copy(picture, None, Some(dst))?;
+                }
             let toggles = Toggles { fullscreen, keyboard_grab: grab, mouse_lock, relative_mouse, muted };
             toolbar.draw(&mut canvas, window_width, &stats, |action| toggles.get(action));
+            let present_start = Instant::now();
             canvas.present();
+            shown.present += present_start.elapsed();
             redraw = false;
         }
+        shown.report();
     }
 
     if let Some(path) = &args.dump_window {
@@ -580,8 +666,15 @@ fn main() -> anyhow::Result<()> {
         canvas.clear();
         let dst = letterbox(canvas.window().size(), (width, height));
         if have_frame {
-            canvas.copy(&texture, None, Some(dst))?;
-        }
+                #[cfg(windows)]
+                let picture = match (shown_target, &gpu_targets) {
+                    (Some(index), Some(targets)) => &targets.textures[index],
+                    _ => &texture,
+                };
+                #[cfg(not(windows))]
+                let picture = (&texture, shown_target).0;
+                canvas.copy(picture, None, Some(dst))?;
+            }
         let window_width = canvas.window().size().0 as f32;
         let stats = summary.lock().unwrap().clone();
         toolbar.draw(&mut canvas, window_width, &stats, |action| match action {

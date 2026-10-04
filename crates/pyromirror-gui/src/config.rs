@@ -52,6 +52,8 @@ pub struct Config {
     pub fullscreen: bool,
     pub lock_mouse: bool,
     pub play_audio: bool,
+    /// Decode straight into the window's textures where the system can.
+    pub zero_copy_display: bool,
 
     // Host
     pub port: u16,
@@ -85,6 +87,7 @@ impl Default for Config {
             fullscreen: false,
             lock_mouse: false,
             play_audio: true,
+            zero_copy_display: true,
             port: 9000,
             bitrate_mbps: 250,
             fps: 60,
@@ -196,6 +199,9 @@ impl Config {
         }
         if !self.play_audio {
             args.push("--no-audio".into());
+        }
+        if !self.zero_copy_display {
+            args.push("--no-zero-copy".into());
         }
         args
     }

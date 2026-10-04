@@ -862,6 +862,13 @@ impl App {
             ui.label(RichText::new("Used from the next connection. All three can also be switched from the menu while connected.").color(MUTED).small());
         });
 
+        ui.add_space(4.0);
+        card(ui, |ui| {
+            section(ui, "Display");
+            ui.checkbox(&mut self.config.zero_copy_display, "Keep frames on the graphics card (faster)");
+            ui.label(RichText::new("Draws the picture straight from where it is decoded instead of copying it through memory. Turn this off if the picture comes out wrong.").color(MUTED).small());
+        });
+
     }
 
     fn general_settings(&mut self, ui: &mut egui::Ui) {
