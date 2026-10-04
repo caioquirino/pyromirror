@@ -2979,6 +2979,7 @@ name = "pyromirror-client"
 version = "0.1.0-beta.7"
 dependencies = [
  "anyhow",
+ "cc",
  "clap",
  "crossbeam-channel",
  "env_logger",
