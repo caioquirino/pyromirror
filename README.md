@@ -165,8 +165,8 @@ On Windows, remote input cannot reach administrator windows or UAC prompts.
 
 - **Encryption.**
 - **Code signing on Windows.**
-- **HDR.** With HDR on, Windows hands out a washed-out picture.
-- **A direct GPU path.** Frames take a detour through the CPU on both ends, which costs a few milliseconds.
+- **HDR output.** An HDR desktop on Windows is converted to SDR for the stream; highlights brighter than SDR white are clipped.
+- **A direct GPU path on Linux.** On Windows frames stay on the graphics card on both ends. On Linux they still take a detour through memory, which costs a few milliseconds ([what is needed](docs/zero-copy-linux.md)).
 - **Clipboard sharing, file transfer, gamepads.**
 - **Changing resolution while sharing**, and choosing a monitor from the launcher.
 - **An Android client.**
