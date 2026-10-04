@@ -74,8 +74,6 @@
   th { color: var(--muted); font-weight: 600; font-size: 13px; text-transform: uppercase; letter-spacing: .5px; }
   tr:last-child td { border-bottom: 0; }
   code { background: var(--field); padding: 2px 7px; border-radius: 5px; font-size: 14px; }
-  td.na { color: var(--muted); }
-  #release-note { color: var(--muted); font-size: 15px; margin: 0 0 18px; }
 
   .note { border-left: 4px solid var(--yellow); background: rgba(242,193,78,.08); padding: 14px 18px; border-radius: 0 10px 10px 0; margin-top: 22px; color: var(--text); font-size: 15.5px; }
   .two { display: grid; grid-template-columns: 1fr 1fr; gap: 18px; }
@@ -113,7 +111,7 @@
       <h1>Remote desktop for your <em>local network</em>, built for low latency.</h1>
       <p class="lead">PyroMirror streams a desktop between two computers over Ethernet using the PyroWave GPU codec: every frame stands alone, so a lost packet costs a blurry patch instead of a stalled picture.</p>
       <div class="actions">
-        <a class="button" href="#download">Download</a>
+        <a class="button" href="https://github.com/caioquirino/pyromirror/releases">Download</a>
         <a class="button secondary" href="https://github.com/caioquirino/pyromirror">View the source</a>
       </div>
     </div>
@@ -150,16 +148,18 @@
 
   <section id="download">
     <h2>Download</h2>
-    <p id="release-note">Packages for every release are on the <a href="https://github.com/caioquirino/pyromirror/releases">releases page</a>.</p>
+    <p class="sub">Every release is published on GitHub with packages for each system. The newest one is at the top of the page.</p>
+    <p><a class="button" href="https://github.com/caioquirino/pyromirror/releases">Go to the releases page</a></p>
+    <p class="sub" style="margin-top:28px">Pick the file for your system:</p>
     <table>
       <thead><tr><th>System</th><th>Package</th><th>Install</th></tr></thead>
       <tbody>
-        <tr><td>Windows 10 / 11</td><td data-asset="windows-x86_64.msi">MSI installer</td><td>Run it; adds a Start menu entry</td></tr>
-        <tr><td>Windows, portable</td><td data-asset="windows-x86_64.zip">Zip archive</td><td>Unzip, run <code>pyromirror.exe</code></td></tr>
-        <tr><td>Debian / Ubuntu 24.04+</td><td data-asset="_amd64.deb">.deb package</td><td><code>sudo apt install ./pyromirror_*.deb</code></td></tr>
-        <tr><td>Fedora 40+</td><td data-asset=".x86_64.rpm">.rpm package</td><td><code>sudo dnf install ./pyromirror-*.rpm</code></td></tr>
-        <tr><td>Arch Linux</td><td data-asset=".pkg.tar.zst">Pacman package</td><td><code>sudo pacman -U pyromirror-*.pkg.tar.zst</code></td></tr>
-        <tr><td>Other Linux</td><td data-asset="linux-x86_64.tar.gz">Tarball</td><td>Unpack, run <code>./pyromirror</code></td></tr>
+        <tr><td>Windows 10 / 11</td><td>MSI installer</td><td>Run it; adds a Start menu entry</td></tr>
+        <tr><td>Windows, portable</td><td>Zip archive</td><td>Unzip, run <code>pyromirror.exe</code></td></tr>
+        <tr><td>Debian / Ubuntu 24.04+</td><td>.deb package</td><td><code>sudo apt install ./pyromirror_*.deb</code></td></tr>
+        <tr><td>Fedora 40+</td><td>.rpm package</td><td><code>sudo dnf install ./pyromirror-*.rpm</code></td></tr>
+        <tr><td>Arch Linux</td><td>Pacman package</td><td><code>sudo pacman -U pyromirror-*.pkg.tar.zst</code></td></tr>
+        <tr><td>Other Linux</td><td>Tarball</td><td>Unpack, run <code>./pyromirror</code></td></tr>
       </tbody>
     </table>
     <div class="note"><strong>Windows builds are not code-signed yet.</strong> Windows may warn about them, and Smart App Control blocks them. Signing through SignPath is being set up.</div>
@@ -195,36 +195,5 @@
   </footer>
 </div>
 
-<script>
-// Turn the package names into direct links to the newest release (including pre-releases).
-fetch("https://api.github.com/repos/caioquirino/pyromirror/releases?per_page=1")
-  .then(function (r) { return r.ok ? r.json() : []; })
-  .then(function (releases) {
-    var release = releases[0];
-    if (!release) return;
-    document.querySelectorAll("[data-asset]").forEach(function (cell) {
-      var suffix = cell.getAttribute("data-asset");
-      var asset = release.assets.find(function (a) { return a.name.endsWith(suffix); });
-      if (asset) {
-        var link = document.createElement("a");
-        link.href = asset.browser_download_url;
-        link.textContent = cell.textContent + " (" + (asset.size / 1048576).toFixed(0) + " MB)";
-        cell.textContent = "";
-        cell.appendChild(link);
-      } else {
-        cell.className = "na";
-        cell.textContent += " (not in this release)";
-      }
-    });
-    var note = document.getElementById("release-note");
-    note.textContent = "Latest release: ";
-    var link = document.createElement("a");
-    link.href = release.html_url;
-    link.textContent = release.name || release.tag_name;
-    note.appendChild(link);
-    note.appendChild(document.createTextNode(release.prerelease ? " (pre-release)." : "."));
-  })
-  .catch(function () {});
-</script>
 </body>
 </html>
