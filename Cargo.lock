@@ -3054,6 +3054,7 @@ dependencies = [
  "pyromirror-codec",
  "pyromirror-net",
  "pyromirror-proto",
+ "windows-sys 0.61.2",
  "winresource",
 ]
 

@@ -4,6 +4,7 @@
 //! connection per client carries the handshake and input events.
 
 mod permissions;
+mod priority;
 mod source;
 
 use std::io::Write;
@@ -99,6 +100,11 @@ struct Args {
     /// instead of encoding straight from the captured texture
     #[arg(long)]
     no_zero_copy: bool,
+
+    /// Windows: leave this process at normal processor and graphics priority. It is raised
+    /// otherwise, so that a game on this computer does not hold the stream up
+    #[arg(long)]
+    no_priority: bool,
 
     /// Ignore the client's mouse and keyboard (view-only)
     #[arg(long)]
@@ -289,6 +295,9 @@ fn main() -> anyhow::Result<()> {
 
     if args.check_permissions {
         return permissions::check(SocketAddr::new(args.bind, args.port), args.monitor, !args.no_input);
+    }
+    if !args.no_priority {
+        priority::raise();
     }
 
     let chroma = match args.chroma {

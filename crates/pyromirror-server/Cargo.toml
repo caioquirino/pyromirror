@@ -16,5 +16,8 @@ log = { workspace = true }
 env_logger = { workspace = true }
 anyhow = { workspace = true }
 
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_LibraryLoader", "Win32_System_Threading"] }
+
 [build-dependencies]
 winresource = "0.1"

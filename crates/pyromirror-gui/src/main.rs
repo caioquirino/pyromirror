@@ -879,6 +879,11 @@ impl App {
                 section(ui, "Capture");
                 ui.checkbox(&mut self.config.zero_copy, "Keep frames on the graphics card (faster)");
                 ui.label(RichText::new("Encodes straight from the captured picture instead of copying it through memory. Turn this off if the picture comes out wrong.").color(MUTED).small());
+                if cfg!(windows) {
+                    ui.add_space(4.0);
+                    ui.checkbox(&mut self.config.priority, "Run ahead of games and other programs");
+                    ui.label(RichText::new("Keeps the stream smooth while a game has this computer busy. Turn this off if the game itself slows down while you share.").color(MUTED).small());
+                }
             });
         });
     }

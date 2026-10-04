@@ -68,6 +68,8 @@ pub struct Config {
     pub pace_factor: f64,
     /// Encode straight from the captured texture where the system can.
     pub zero_copy: bool,
+    /// Windows: run ahead of other programs, so that a game does not hold the stream up.
+    pub priority: bool,
 
     // Startup
     /// Start in the tray when the user logs in.
@@ -99,6 +101,7 @@ impl Default for Config {
             mtu: 1400,
             pace_factor: 2.0,
             zero_copy: true,
+            priority: true,
             autostart: false,
             auto_share: false,
         }
@@ -185,6 +188,9 @@ impl Config {
         }
         if !self.zero_copy {
             args.push("--no-zero-copy".into());
+        }
+        if !self.priority {
+            args.push("--no-priority".into());
         }
         args
     }
