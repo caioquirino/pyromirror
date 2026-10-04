@@ -242,6 +242,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
+          # GitHub turns "~" in asset names into ".", so use the final names before checksumming;
+          # otherwise SHA256SUMS would list files that do not exist under those names.
+          for f in *~*; do [ -e "$f" ] && mv "$f" "${f//\~/.}"; done
           sha256sum * > SHA256SUMS
           # A version with a hyphen (1.2.3-beta.1) is a pre-release.
           FLAGS=()
