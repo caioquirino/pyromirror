@@ -3,8 +3,8 @@
 //! - Windows: DXGI Desktop Duplication.
 //! - Linux: xdg-desktop-portal ScreenCast + PipeWire.
 //!
-//! Both backends currently deliver CPU-readable 32-bit frames. Handing the GPU texture straight
-//! to the encoder (D3D11 shared handle / DMA-BUF) is future work.
+//! Both backends deliver CPU-readable 32-bit frames, or leave the picture on the GPU for the
+//! encoder to import: a shared Direct3D texture on Windows, the compositor's DMA-BUFs on Linux.
 
 mod input;
 mod keymap;
@@ -42,6 +42,28 @@ pub struct CaptureOptions {
     /// Windows: monitor index in DXGI enumeration order; `None` selects the primary monitor.
     /// Ignored on Linux, where the portal dialog picks the monitor.
     pub output: Option<u32>,
+    /// Linux: what the encoder can import, which makes capture ask the compositor for frames as
+    /// DMA-BUFs (`Frame::dmabuf`). `None` asks for pixels.
+    pub dmabuf: Option<DmaBufModifiers>,
+}
+
+/// The DRM format modifiers with which a DMA-BUF can be used, by the order of its channels.
+#[derive(Debug, Clone, Default)]
+pub struct DmaBufModifiers {
+    pub bgrx: Vec<u64>,
+    pub rgbx: Vec<u64>,
+}
+
+/// A frame that is a DMA-BUF (Linux): where it is and how the picture is laid out in it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaBuf {
+    /// Borrowed from the capturer, like the frame.
+    pub fd: i32,
+    pub modifier: u64,
+    /// How many memory planes there are (1 to 4); that many `offsets` and `strides` count.
+    pub planes: u32,
+    pub offsets: [u32; 4],
+    pub strides: [u32; 4],
 }
 
 /// A captured desktop image, borrowed from the capturer until the next `next_frame` call.
@@ -53,10 +75,13 @@ pub struct Frame<'a> {
     /// Bytes per row; may be larger than `width * 4`.
     pub stride: u32,
     pub format: PixelFormat,
-    /// Set when GPU frames are enabled and the image is in the capturer's shared texture
-    /// instead of `data`. The value identifies the texture: when it changes, the texture has
-    /// been replaced and must be exported again (`Capturer::export_texture`).
+    /// Set when the image stayed on the GPU instead of being in `data`. The value identifies
+    /// the texture it is in. Windows: there is one shared texture; when the value changes it has
+    /// been replaced and must be exported again (`Capturer::export_texture`). Linux: one of a
+    /// few DMA-BUFs the compositor cycles through, described by `dmabuf`; a value is never used
+    /// for another buffer.
     pub texture: Option<u64>,
+    pub dmabuf: Option<DmaBuf>,
     /// How long it took to get the image here (reading it back from the GPU, or copying it
     /// there), not counting the wait for the desktop to change. Zero where not measured.
     pub prepare: Duration,
@@ -73,6 +98,10 @@ struct RawConfig {
     pipewire_fd: i32,
     pipewire_node: u32,
     cursor_metadata: bool,
+    dmabuf_modifiers_bgrx: *const u64,
+    dmabuf_modifiers_bgrx_count: u32,
+    dmabuf_modifiers_rgbx: *const u64,
+    dmabuf_modifiers_rgbx_count: u32,
 }
 
 #[repr(C)]
@@ -114,6 +143,11 @@ struct RawFrame {
     format: u32,
     gpu_texture: u64,
     prepare_us: u32,
+    dmabuf_fd: i32,
+    dmabuf_planes: u32,
+    dmabuf_modifier: u64,
+    dmabuf_offsets: [u32; 4],
+    dmabuf_strides: [u32; 4],
 }
 
 const RAW_FORMAT_RGBX: u32 = 1;
@@ -164,7 +198,18 @@ impl Capturer {
             pipewire_fd: -1,
             pipewire_node: 0,
             cursor_metadata: false,
+            dmabuf_modifiers_bgrx: std::ptr::null(),
+            dmabuf_modifiers_bgrx_count: 0,
+            dmabuf_modifiers_rgbx: std::ptr::null(),
+            dmabuf_modifiers_rgbx_count: 0,
         };
+        // Borrowed from `options` for the call below, which copies them.
+        if let Some(modifiers) = &options.dmabuf {
+            config.dmabuf_modifiers_bgrx = modifiers.bgrx.as_ptr();
+            config.dmabuf_modifiers_bgrx_count = modifiers.bgrx.len() as u32;
+            config.dmabuf_modifiers_rgbx = modifiers.rgbx.as_ptr();
+            config.dmabuf_modifiers_rgbx_count = modifiers.rgbx.len() as u32;
+        }
 
         // Windows needs no consent to capture; on Linux the portal decides.
         #[cfg(not(target_os = "linux"))]
@@ -266,6 +311,10 @@ impl Capturer {
     /// Asks for frames to stay on the GPU (`Frame::texture`) rather than be read back as pixels.
     /// Returns false where capture cannot do that. Switching it off again makes the next
     /// `next_frame` return the latest image as pixels, so nothing is lost by trying.
+    ///
+    /// Linux: whether frames stay on the GPU is settled with the compositor at the start
+    /// (`CaptureOptions::dmabuf`), and enabling only reports the outcome. Switching it off asks
+    /// the compositor for pixels from then on; they come with the next frame it draws.
     pub fn set_gpu_frames(&mut self, enable: bool) -> bool {
         unsafe { pyromirror_capture_set_gpu(self.ctx, enable) }
     }
@@ -282,7 +331,20 @@ impl Capturer {
     /// Waits up to `timeout` for the desktop to change. `Ok(None)` means nothing was redrawn,
     /// which is the normal state of an idle desktop.
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>, CaptureError> {
-        let mut raw = RawFrame { data: std::ptr::null(), width: 0, height: 0, stride: 0, format: 0, gpu_texture: 0, prepare_us: 0 };
+        let mut raw = RawFrame {
+            data: std::ptr::null(),
+            width: 0,
+            height: 0,
+            stride: 0,
+            format: 0,
+            gpu_texture: 0,
+            prepare_us: 0,
+            dmabuf_fd: -1,
+            dmabuf_planes: 0,
+            dmabuf_modifier: 0,
+            dmabuf_offsets: [0; 4],
+            dmabuf_strides: [0; 4],
+        };
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         match unsafe { pyromirror_capture_acquire(self.ctx, timeout_ms, &mut raw) } {
             RAW_FRAME => {
@@ -293,6 +355,13 @@ impl Capturer {
                     // spacing until the next acquire/release, which needs `&mut self`.
                     data: if on_gpu { &[] } else { unsafe { std::slice::from_raw_parts(raw.data, len) } },
                     texture: (raw.gpu_texture != 0).then_some(raw.gpu_texture),
+                    dmabuf: (raw.dmabuf_planes > 0).then_some(DmaBuf {
+                        fd: raw.dmabuf_fd,
+                        modifier: raw.dmabuf_modifier,
+                        planes: raw.dmabuf_planes,
+                        offsets: raw.dmabuf_offsets,
+                        strides: raw.dmabuf_strides,
+                    }),
                     prepare: Duration::from_micros(raw.prepare_us as u64),
                     width: raw.width,
                     height: raw.height,

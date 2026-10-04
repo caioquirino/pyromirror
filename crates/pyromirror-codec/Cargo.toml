@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 pyrowave-sys = { path = "../pyrowave-sys" }
 thiserror = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"

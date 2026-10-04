@@ -31,6 +31,13 @@ typedef struct pyromirror_capture_config {
     // Linux: true if the portal delivers the pointer as stream metadata rather than drawing it
     // into the frames.
     bool cursor_metadata;
+    // Linux: the DRM format modifiers with which the encoder can import a DMA-BUF, for frames
+    // with B, G, R first and with R, G, B first. Both empty: frames come as shared memory only.
+    // Copied; the lists need not outlive the call.
+    const uint64_t* dmabuf_modifiers_bgrx;
+    uint32_t dmabuf_modifiers_bgrx_count;
+    const uint64_t* dmabuf_modifiers_rgbx;
+    uint32_t dmabuf_modifiers_rgbx_count;
 } pyromirror_capture_config;
 
 // The desktop's mouse pointer, kept out of the picture so the viewer can draw it locally.
@@ -58,6 +65,14 @@ typedef struct pyromirror_capture_frame {
     // Microseconds spent getting the image to where it is handed out from (reading it back, or
     // copying it on the GPU), not counting the wait for the desktop to change. 0 if not measured.
     uint32_t prepare_us;
+    // Linux: set when the frame is a DMA-BUF (`dmabuf_planes` is 1 to 4, otherwise 0). Then
+    // `gpu_texture` identifies the buffer: the compositor cycles through a few, and an id is
+    // never used for another buffer. `dmabuf_fd` is borrowed and valid until the next acquire.
+    int32_t dmabuf_fd;
+    uint32_t dmabuf_planes;
+    uint64_t dmabuf_modifier;
+    uint32_t dmabuf_offsets[4];
+    uint32_t dmabuf_strides[4];
 } pyromirror_capture_frame;
 
 // Returns NULL on failure; if `error` is non-NULL a description is written to it.
@@ -70,11 +85,14 @@ void pyromirror_capture_get_cursor(pyromirror_capture_context* ctx, pyromirror_c
 // Windows: position and size of the captured monitor in virtual-desktop pixels. Returns false
 // where that is not known (Linux).
 bool pyromirror_capture_get_bounds(pyromirror_capture_context* ctx, int32_t* x, int32_t* y, uint32_t* width, uint32_t* height);
-// Zero-copy capture (Windows). When enabled, frames are left in a shared GPU texture instead of
-// being read back: the frame's `gpu_texture` is set and its `data` is NULL. The texture's
-// contents are complete when acquire returns, and stay untouched until the next acquire.
-// Disabling it makes the next acquire return the most recent image again, as pixels, so a
-// consumer that could not use the texture loses nothing. Returns false where unsupported.
+// Zero-copy capture. When enabled, frames are left in a shared GPU texture instead of being read
+// back: the frame's `gpu_texture` is set and its `data` is NULL. The texture's contents are
+// complete when acquire returns, and stay untouched until the next acquire.
+// Windows: disabling it makes the next acquire return the most recent image again, as pixels, so
+// a consumer that could not use the texture loses nothing. Returns false where unsupported.
+// Linux: frames stay on the GPU from the start if DMA-BUFs were negotiated (see the config), and
+// enabling only reports whether they were. Disabling asks the compositor for shared memory
+// instead, for good; pixels arrive with the next frame it draws.
 bool pyromirror_capture_set_gpu(pyromirror_capture_context* ctx, bool enable);
 // A new handle to the current shared texture (Windows: NT handle of an ID3D11Texture2D, BGRA8),
 // owned by the caller; 0 if there is none.

@@ -98,6 +98,10 @@ fn main() {
         .include(pyrowave_src.join("Granite/third_party/khronos/vulkan-headers/include"))
         .warnings(false)
         .compile("pyromirror_pyrowave_glue");
+    // The glue finds the Vulkan loader with dlopen there.
+    if target_os == "linux" {
+        println!("cargo:rustc-link-lib=dl");
+    }
 
     // Place the runtime library next to the final executables (target/<profile>/ and deps/ for
     // tests) so they run without PATH / LD_LIBRARY_PATH tweaks. OUT_DIR is

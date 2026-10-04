@@ -6,6 +6,9 @@
 mod pointer;
 #[cfg(windows)]
 mod gpu_present;
+#[cfg(target_os = "linux")]
+#[path = "gpu_present_linux.rs"]
+mod gpu_present;
 mod toolbar;
 mod video;
 
@@ -18,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
 use clap::Parser;
-use log::{info, warn};
+use log::{debug, info, warn};
 use sdl3::event::{Event, WindowEvent};
 use sdl3::keyboard::{Keycode, Mod, Scancode};
 use sdl3::pixels::{Color, PixelFormat};
@@ -290,20 +293,35 @@ fn main() -> anyhow::Result<()> {
             let usable = device.supports_texture_import();
             (device, usable)
         }
-        _ => (Device::new().context("could not initialise PyroWave")?, false),
+        _ => {
+            let device = Device::new().context("could not initialise PyroWave")?;
+            // Linux: whether the window is drawn on the same GPU is checked when the textures
+            // are set up.
+            let usable = cfg!(target_os = "linux") && !args.no_zero_copy && args.dump_frame.is_none() && device.supports_texture_import();
+            (device, usable)
+        }
     };
     let fragment_path = args.force_fragment || device.prefers_fragment_decode();
-    #[cfg_attr(not(windows), allow(unused_mut))]
+    #[cfg_attr(not(any(windows, target_os = "linux")), allow(unused_mut))]
     let mut decoder = Decoder::new(device, width, height, chroma, fragment_path)
         .context("could not create the PyroWave decoder")?;
 
     // Textures the decoder writes and the window draws, if the two can share them.
-    #[cfg(windows)]
+    #[cfg(any(windows, target_os = "linux"))]
     let gpu_targets = if same_adapter && !fragment_path {
-        match gpu_present::create(&canvas, &texture_creator, &mut decoder) {
-            Ok(targets) => {
+        #[cfg(windows)]
+        let created = gpu_present::create(&canvas, &texture_creator, &mut decoder).map(Some);
+        #[cfg(target_os = "linux")]
+        let created = gpu_present::create(&canvas, &texture_creator, &mut decoder);
+        match created {
+            Ok(Some(targets)) => {
                 info!("Zero-copy display: decoding straight into the window's textures");
                 Some(targets)
+            }
+            Ok(None) => {
+                debug!("Zero-copy display needs SDL to draw with OpenGL on EGL; converting frames on the CPU");
+                decoder.drop_gpu_targets();
+                None
             }
             Err(e) => {
                 warn!("Zero-copy display is not available ({:#}); converting frames on the CPU", e);
@@ -314,7 +332,7 @@ fn main() -> anyhow::Result<()> {
     } else {
         None
     };
-    #[cfg(not(windows))]
+    #[cfg(not(any(windows, target_os = "linux")))]
     let _ = same_adapter;
     // Which set of those holds the picture to show, when it is not in `texture`.
     let mut shown_target: Option<usize> = None;
@@ -641,12 +659,12 @@ fn main() -> anyhow::Result<()> {
             canvas.set_draw_color(if have_frame { Color::RGB(0, 0, 0) } else { Color::RGB(18, 24, 38) });
             canvas.clear();
             if have_frame {
-                    #[cfg(windows)]
+                    #[cfg(any(windows, target_os = "linux"))]
                     let picture = match (shown_target, &gpu_targets) {
                         (Some(index), Some(targets)) => &targets.textures[index],
                         _ => &texture,
                     };
-                    #[cfg(not(windows))]
+                    #[cfg(not(any(windows, target_os = "linux")))]
                     let picture = (&texture, shown_target).0;
                     canvas.copy(picture, None, Some(dst))?;
                 }
@@ -666,12 +684,12 @@ fn main() -> anyhow::Result<()> {
         canvas.clear();
         let dst = letterbox(canvas.window().size(), (width, height));
         if have_frame {
-                #[cfg(windows)]
+                #[cfg(any(windows, target_os = "linux"))]
                 let picture = match (shown_target, &gpu_targets) {
                     (Some(index), Some(targets)) => &targets.textures[index],
                     _ => &texture,
                 };
-                #[cfg(not(windows))]
+                #[cfg(not(any(windows, target_os = "linux")))]
                 let picture = (&texture, shown_target).0;
                 canvas.copy(picture, None, Some(dst))?;
             }

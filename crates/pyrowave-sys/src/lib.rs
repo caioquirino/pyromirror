@@ -124,6 +124,22 @@ extern "C" {
         writable: bool,
         out: *mut *mut pm_gpu_image,
     ) -> pyrowave_result;
+    pub fn pm_dmabuf_modifiers(device: pyrowave_device, format: c_int, writable: bool, out: *mut u64, capacity: usize) -> usize;
+    pub fn pm_device_drm_render_node(device: pyrowave_device, major: *mut i64, minor: *mut i64) -> bool;
+    pub fn pm_gpu_fence_create(device: pyrowave_device, out: *mut *mut pm_gpu_fence) -> pyrowave_result;
+    pub fn pm_gpu_image_import_dmabuf(
+        device: pyrowave_device,
+        fd: c_int,
+        width: u32,
+        height: u32,
+        format: c_int,
+        modifier: u64,
+        planes: u32,
+        offsets: *const u32,
+        strides: *const u32,
+        writable: bool,
+        out: *mut *mut pm_gpu_image,
+    ) -> pyrowave_result;
     pub fn pm_gpu_fence_import(device: pyrowave_device, handle: usize, out: *mut *mut pm_gpu_fence) -> pyrowave_result;
     pub fn pm_gpu_fence_destroy(fence: *mut pm_gpu_fence);
     pub fn pm_gpu_decode(

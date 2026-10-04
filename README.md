@@ -166,7 +166,7 @@ On Windows, remote input cannot reach administrator windows or UAC prompts.
 - **Encryption.**
 - **Code signing on Windows.**
 - **HDR output.** An HDR desktop on Windows is converted to SDR for the stream; highlights brighter than SDR white are clipped.
-- **A direct GPU path on Linux.** On Windows frames stay on the graphics card on both ends. On Linux they still take a detour through memory, which costs a few milliseconds ([what is needed](docs/zero-copy-linux.md)).
+- **A direct GPU path on every Linux setup.** Frames stay on the graphics card on both ends on Windows, and on Linux with AMD graphics on KDE Wayland, which is where it was built. GNOME, NVIDIA's own driver and laptops with two graphics cards are untried; where it does not work, frames take a detour through memory, which costs a few milliseconds ([details](docs/zero-copy-linux.md)).
 - **Clipboard sharing, file transfer, gamepads.**
 - **Changing resolution while sharing**, and choosing a monitor from the launcher.
 - **An Android client.**

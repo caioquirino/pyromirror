@@ -2,11 +2,15 @@
 //!
 //! Frames go through PyroWave's CPU-buffer entry points: packed 8-bit RGB is converted to planar
 //! BT.709 full-range YCbCr on the CPU, uploaded, and encoded on the GPU. The decoder mirrors
-//! that. This costs one colour-conversion pass and one upload/readback per frame; the zero-copy
-//! external-memory path (`pyrowave_encoder_encode_gpu_scaled_synchronous`) is the next step.
+//! that. This costs one colour-conversion pass and one upload/readback per frame.
+//!
+//! Where the picture is in a texture another graphics API owns (a shared Direct3D texture, a
+//! DMA-BUF), the encoder can import that and encode straight from it (`Encoder::import_texture`),
+//! and the decoder can write into such textures (`Decoder::add_gpu_target`).
 
 mod color;
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Arc;
 
@@ -108,6 +112,32 @@ impl Device {
         unsafe { sys::pyrowave_device_confirm_interop_support(self.raw) }
     }
 
+    /// The DRM format modifiers with which this device can import a DMA-BUF of `format` to
+    /// encode from (Linux). Empty where there are no DMA-BUFs, or the driver cannot import them.
+    pub fn dmabuf_modifiers(&self, format: PixelFormat) -> Vec<u64> {
+        self.modifiers(raw_format(format), false)
+    }
+
+    /// The DRM format modifiers with which this device can import a single-channel DMA-BUF as a
+    /// plane to decode into (`Decoder::add_gpu_target`).
+    pub fn dmabuf_plane_modifiers(&self) -> Vec<u64> {
+        self.modifiers(sys::PM_FORMAT_R8, true)
+    }
+
+    fn modifiers(&self, format: std::os::raw::c_int, writable: bool) -> Vec<u64> {
+        let mut modifiers = vec![0u64; 64];
+        let count = unsafe { sys::pm_dmabuf_modifiers(self.raw, format, writable, modifiers.as_mut_ptr(), modifiers.len()) };
+        modifiers.truncate(count);
+        modifiers
+    }
+
+    /// The DRM render node (major, minor) of the GPU this device runs on, where that is known
+    /// (Linux). DMA-BUFs can only be shared with whatever else runs on the same GPU.
+    pub fn drm_render_node(&self) -> Option<(i64, i64)> {
+        let (mut major, mut minor) = (0i64, 0i64);
+        unsafe { sys::pm_device_drm_render_node(self.raw, &mut major, &mut minor) }.then_some((major, minor))
+    }
+
     /// True on GPUs with weak compute support (most mobile chips).
     pub fn prefers_fragment_decode(&self) -> bool {
         unsafe { sys::pyrowave_decoder_device_prefers_fragment_path(self.raw) }
@@ -171,6 +201,13 @@ impl Planes {
     }
 }
 
+fn raw_format(format: PixelFormat) -> std::os::raw::c_int {
+    match format {
+        PixelFormat::Bgrx => sys::PM_FORMAT_BGRA8,
+        PixelFormat::Rgbx => sys::PM_FORMAT_RGBA8,
+    }
+}
+
 fn check_packed(width: usize, height: usize, stride: usize, len: usize) -> Result<(), CodecError> {
     let required = if height == 0 { 0 } else { stride * (height - 1) + width * 4 };
     if stride < width * 4 || len < required {
@@ -185,10 +222,11 @@ pub struct Encoder {
     bitstream: Vec<u8>,
     packets: Vec<sys::pyrowave_packet>,
     num_packets: usize,
-    /// A texture owned by another graphics API, to encode from without copying.
-    texture: Option<Texture>,
-    /// Where the most recent frame came from, for `encode_last`.
-    last_from_texture: bool,
+    /// Textures owned by another graphics API, to encode from without copying, by the id their
+    /// owner knows them by.
+    textures: HashMap<u64, Texture>,
+    /// The texture the most recent frame came from, if it was one; for `encode_last`.
+    last_texture: Option<u64>,
     device: Arc<Device>,
 }
 
@@ -207,11 +245,66 @@ struct Texture {
     exact_size: bool,
 }
 
+/// More textures than any capture hands out at once; reaching it means old ones were left
+/// behind by a capture that replaced its buffers.
+const MAX_TEXTURES: usize = 16;
+
+/// How the picture is laid out in a DMA-BUF.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DmaBufPlanes {
+    /// The DRM format modifier the buffer was allocated with.
+    pub modifier: u64,
+    /// How many memory planes it has (1 to 4); that many `offsets` and `strides` count.
+    pub planes: u32,
+    pub offsets: [u32; 4],
+    pub strides: [u32; 4],
+}
+
 /// What kind of OS handle `Encoder::import_texture` is given.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TextureHandle {
-    /// The NT handle of a shared `ID3D11Texture2D` (Windows).
+    /// The NT handle of a shared `ID3D11Texture2D` (Windows). The handle is consumed.
     D3d11(usize),
+    /// The file descriptor of a DMA-BUF (Linux). It stays the caller's; a duplicate is imported.
+    DmaBuf { fd: i32, layout: DmaBufPlanes },
+}
+
+/// Imports `handle` as something to encode from, or with `writable` to decode into.
+fn import_image(device: &Device, handle: TextureHandle, width: u32, height: u32, format: std::os::raw::c_int, writable: bool) -> Result<GpuImage, CodecError> {
+    let mut raw = std::ptr::null_mut();
+    match handle {
+        TextureHandle::D3d11(handle) => check("image_create", unsafe {
+            sys::pm_gpu_image_import(device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, format, writable, &mut raw)
+        })?,
+        #[cfg(target_os = "linux")]
+        TextureHandle::DmaBuf { fd, layout } => {
+            // PyroWave closes the descriptor it is given.
+            let fd = unsafe { libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 0) };
+            if fd < 0 {
+                return Err(CodecError::Call { call: "import_texture (the DMA-BUF could not be duplicated)", code: sys::PYROWAVE_ERROR_FAILED_EXTERNAL_HANDLE });
+            }
+            check("image_create", unsafe {
+                sys::pm_gpu_image_import_dmabuf(
+                    device.raw,
+                    fd,
+                    width,
+                    height,
+                    format,
+                    layout.modifier,
+                    layout.planes,
+                    layout.offsets.as_ptr(),
+                    layout.strides.as_ptr(),
+                    writable,
+                    &mut raw,
+                )
+            })?
+        }
+        #[cfg(not(target_os = "linux"))]
+        TextureHandle::DmaBuf { .. } => {
+            return Err(CodecError::Call { call: "import_texture (no DMA-BUFs on this system)", code: sys::PYROWAVE_ERROR_INVALID_ARGUMENT });
+        }
+    }
+    Ok(GpuImage(raw))
 }
 
 unsafe impl Send for Encoder {}
@@ -233,53 +326,47 @@ impl Encoder {
             bitstream: Vec::new(),
             packets: Vec::new(),
             num_packets: 0,
-            texture: None,
-            last_from_texture: false,
+            textures: HashMap::new(),
+            last_texture: None,
             device,
         })
     }
 
-    /// Takes a texture owned by another graphics API as the source for `encode_texture`,
-    /// replacing any earlier one. It may be larger than the encoder; it is scaled down on the
-    /// GPU. The handle is consumed, whether this succeeds or not.
-    pub fn import_texture(&mut self, handle: TextureHandle, width: u32, height: u32, format: PixelFormat) -> Result<(), CodecError> {
-        self.texture = None;
-        let TextureHandle::D3d11(handle) = handle;
-        let format = match format {
-            PixelFormat::Bgrx => sys::PM_FORMAT_BGRA8,
-            PixelFormat::Rgbx => sys::PM_FORMAT_RGBA8,
-        };
-        let mut raw = std::ptr::null_mut();
-        check("image_create", unsafe {
-            sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, format, false, &mut raw)
-        })?;
+    /// Takes a texture owned by another graphics API as a source for `encode_texture`, under the
+    /// id its owner knows it by. It may be larger than the encoder; it is scaled down on the GPU.
+    pub fn import_texture(&mut self, id: u64, handle: TextureHandle, width: u32, height: u32, format: PixelFormat) -> Result<(), CodecError> {
+        self.textures.remove(&id);
+        if self.textures.len() >= MAX_TEXTURES {
+            self.drop_textures();
+        }
+        let image = import_image(&self.device, handle, width, height, raw_format(format), false)?;
         let exact_size = width as usize == self.planes.width && height as usize == self.planes.height;
-        self.texture = Some(Texture { image: GpuImage(raw), exact_size });
+        self.textures.insert(id, Texture { image, exact_size });
         Ok(())
     }
 
-    pub fn has_texture(&self) -> bool {
-        self.texture.is_some()
+    pub fn has_texture(&self, id: u64) -> bool {
+        self.textures.contains_key(&id)
     }
 
-    /// Forgets the imported texture.
-    pub fn drop_texture(&mut self) {
-        self.texture = None;
-        self.last_from_texture = false;
+    /// Forgets the imported textures.
+    pub fn drop_textures(&mut self) {
+        self.textures.clear();
+        self.last_texture = None;
     }
 
-    /// Encodes what the imported texture holds right now. Its owner must have finished writing
-    /// it, and must leave it alone until this returns. Scaling and colour conversion happen on
-    /// the GPU; no pixels pass through memory.
-    pub fn encode_texture(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
-        let Some(texture) = &self.texture else {
-            return Err(CodecError::Call { call: "encode_texture (no texture imported)", code: sys::PYROWAVE_ERROR_INVALID_ARGUMENT });
+    /// Encodes what the imported texture `id` holds right now. Its owner must have finished
+    /// writing it, and must leave it alone until this returns. Scaling and colour conversion
+    /// happen on the GPU; no pixels pass through memory.
+    pub fn encode_texture(&mut self, id: u64, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
+        let Some(texture) = self.textures.get(&id) else {
+            return Err(CodecError::Call { call: "encode_texture (no such texture imported)", code: sys::PYROWAVE_ERROR_INVALID_ARGUMENT });
         };
         let max_frame_bytes = Self::frame_budget(max_frame_bytes);
         check("encoder_encode_gpu_scaled_synchronous", unsafe {
             sys::pm_gpu_image_encode(self.raw, texture.image.0, texture.exact_size, max_frame_bytes)
         })?;
-        self.last_from_texture = true;
+        self.last_texture = Some(id);
         self.packetize(max_frame_bytes, packet_boundary)
     }
 
@@ -318,16 +405,16 @@ impl Encoder {
         let (w, h, chroma) = (self.planes.width, self.planes.height, self.planes.chroma);
         let [y, cb, cr] = &mut self.planes.data;
         color::packed_to_planar(pixels, stride, format, w, h, chroma, y, cb, cr);
-        self.last_from_texture = false;
+        self.last_texture = None;
         self.encode_planes(max_frame_bytes, packet_boundary)
     }
 
     /// Encodes the previously submitted frame again, e.g. to refresh a static desktop so that a
     /// client which lost packets converges to a clean image.
     pub fn encode_last(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
-        if self.last_from_texture && self.texture.is_some() {
+        if let Some(id) = self.last_texture.filter(|id| self.textures.contains_key(id)) {
             // The texture still holds that frame.
-            return self.encode_texture(max_frame_bytes, packet_boundary);
+            return self.encode_texture(id, max_frame_bytes, packet_boundary);
         }
         self.encode_planes(max_frame_bytes, packet_boundary)
     }
@@ -379,8 +466,8 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
-        // The texture goes first: it belongs to the same device.
-        self.texture = None;
+        // The textures go first: they belong to the same device.
+        self.textures.clear();
         unsafe { sys::pyrowave_encoder_destroy(self.raw) };
     }
 }
@@ -421,7 +508,8 @@ pub struct Decoder {
     device: Arc<Device>,
 }
 
-/// The other API's fence, through which it learns that a decode has finished.
+/// The fence through which a finished decode is waited for: the other API's where it shares
+/// one, so that it learns of it too, otherwise one of our own.
 struct Fence {
     raw: *mut sys::pm_gpu_fence,
     value: u64,
@@ -458,6 +546,11 @@ impl Decoder {
         Ok(Self { raw, planes, targets: Vec::new(), fence: None, device })
     }
 
+    /// The device this decoder runs on.
+    pub fn device(&self) -> &Device {
+        &self.device
+    }
+
     /// The sizes of the Y, Cb and Cr planes, which is what textures for `add_gpu_target` must
     /// have (single channel, 8 bits).
     pub fn plane_sizes(&self) -> [(u32, u32); 3] {
@@ -479,17 +572,23 @@ impl Decoder {
         Ok(())
     }
 
+    /// Makes a fence of the decoder's own, for where the owner of the target textures has none
+    /// to share (Linux). `decode_to_target` waits either way; the owner needs no telling.
+    pub fn create_gpu_fence(&mut self) -> Result<(), CodecError> {
+        self.fence = None;
+        let mut raw = std::ptr::null_mut();
+        check("sync_object_create", unsafe { sys::pm_gpu_fence_create(self.device.raw, &mut raw) })?;
+        self.fence = Some(Fence { raw, value: 0 });
+        Ok(())
+    }
+
     /// Imports three textures (Y, Cb, Cr; see `plane_sizes`) as something to decode into, and
-    /// returns the set's index for `decode_to_target`. The handles are consumed.
+    /// returns the set's index for `decode_to_target`. Direct3D handles are consumed.
     pub fn add_gpu_target(&mut self, planes: [TextureHandle; 3]) -> Result<usize, CodecError> {
         let sizes = self.plane_sizes();
         let mut images = Vec::with_capacity(3);
-        for (TextureHandle::D3d11(handle), (width, height)) in planes.into_iter().zip(sizes) {
-            let mut raw = std::ptr::null_mut();
-            check("image_create", unsafe {
-                sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, sys::PM_FORMAT_R8, true, &mut raw)
-            })?;
-            images.push(GpuImage(raw));
+        for (handle, (width, height)) in planes.into_iter().zip(sizes) {
+            images.push(import_image(&self.device, handle, width, height, sys::PM_FORMAT_R8, true)?);
         }
         let Ok(set) = <[GpuImage; 3]>::try_from(images) else { unreachable!("three planes were imported") };
         self.targets.push(set);
@@ -557,5 +656,25 @@ impl Drop for Decoder {
         // What belongs to the device goes before the decoder that used it.
         self.drop_gpu_targets();
         unsafe { sys::pyrowave_decoder_destroy(self.raw) };
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_device_that_shares_textures_lists_dmabuf_modifiers() {
+        // No GPU (CI, containers): nothing to check.
+        let Ok(device) = Device::new() else { return };
+        if !device.supports_texture_import() {
+            return;
+        }
+        let modifiers = device.dmabuf_modifiers(PixelFormat::Bgrx);
+        assert!(!modifiers.is_empty(), "a driver that imports DMA-BUFs must name at least one modifier");
+        let mut unique = modifiers.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(unique.len(), modifiers.len());
     }
 }

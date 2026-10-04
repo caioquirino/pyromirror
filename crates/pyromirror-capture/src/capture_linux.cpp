@@ -3,9 +3,16 @@
 // PipeWire screen capture.
 //
 // The node and the PipeWire remote come from the xdg-desktop-portal ScreenCast session set up on
-// the Rust side (src/portal.rs). Frames are requested as CPU-mappable buffers (MemFd / MemPtr),
-// copied out on the PipeWire thread, and handed to the caller from there.
+// the Rust side (src/portal.rs).
+//
+// Frames arrive in one of two ways, settled when the stream is negotiated:
+// - As DMA-BUFs, if the caller named DRM format modifiers its encoder can import and the
+//   compositor can allocate with one of them. The picture stays on the GPU: the newest buffer is
+//   kept out of the compositor's pool while the caller encodes from it.
+// - As CPU-mappable buffers (MemFd / MemPtr) otherwise, copied out on the PipeWire thread.
 
+#include <errno.h>
+#include <poll.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
@@ -38,11 +45,25 @@ struct pyromirror_capture_context {
     uint32_t format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
     bool streaming = false;
 
+    // DMA-BUF modifiers the encoder can import, by channel order. Fixed after creation.
+    std::vector<uint64_t> modifiers_bgrx;
+    std::vector<uint64_t> modifiers_rgbx;
+    // Touched on the PipeWire thread, or with its loop locked.
+    bool dmabuf = false;       // The negotiated buffers are DMA-BUFs.
+    bool gpu_disabled = false; // The caller could not use them; only shared memory is offered now.
+    uint64_t modifier = 0;
+    uint64_t next_buffer_id = 1;
+
     // Shared between the PipeWire thread and the caller.
     std::mutex mutex;
     std::condition_variable cond;
     std::vector<uint8_t> back;
     pyromirror_capture_frame back_info = {};
+    // DMA-BUFs: the newest buffer not handed out yet, and the one the caller is working with.
+    // Both are out of the compositor's pool until they are queued back.
+    struct pw_buffer* pending = nullptr;
+    pyromirror_capture_frame pending_info = {};
+    struct pw_buffer* held = nullptr;
     bool fresh = false;
     bool failed = false;
     std::string last_error;
@@ -135,6 +156,80 @@ static void on_state_changed(void* data, enum pw_stream_state, enum pw_stream_st
     }
 }
 
+static const struct spa_pod* build_shm_format(struct spa_pod_builder* b) {
+    struct spa_rectangle def_size = SPA_RECTANGLE(1920, 1080);
+    struct spa_rectangle min_size = SPA_RECTANGLE(1, 1);
+    struct spa_rectangle max_size = SPA_RECTANGLE(16384, 16384);
+    struct spa_fraction def_rate = SPA_FRACTION(60, 1);
+    struct spa_fraction min_rate = SPA_FRACTION(0, 1);
+    struct spa_fraction max_rate = SPA_FRACTION(1000, 1);
+
+    // No SPA_FORMAT_VIDEO_modifier property: that restricts negotiation to shared-memory buffers.
+    return static_cast<const struct spa_pod*>(spa_pod_builder_add_object(b,
+        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
+        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
+        SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(5,
+            SPA_VIDEO_FORMAT_BGRx,
+            SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
+            SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA),
+        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&def_size, &min_size, &max_size),
+        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&def_rate, &min_rate, &max_rate)));
+}
+
+// A format that can only be delivered as DMA-BUFs with one of `modifiers`. With `size` set it
+// is the final choice: one pixel format (`x_format`), one modifier, that size.
+static const struct spa_pod* build_dmabuf_format(struct spa_pod_builder* b, uint32_t x_format, uint32_t a_format,
+                                                 const uint64_t* modifiers, size_t count, const struct spa_rectangle* size) {
+    struct spa_rectangle def_size = SPA_RECTANGLE(1920, 1080);
+    struct spa_rectangle min_size = SPA_RECTANGLE(1, 1);
+    struct spa_rectangle max_size = SPA_RECTANGLE(16384, 16384);
+    struct spa_fraction def_rate = SPA_FRACTION(60, 1);
+    struct spa_fraction min_rate = SPA_FRACTION(0, 1);
+    struct spa_fraction max_rate = SPA_FRACTION(1000, 1);
+
+    struct spa_pod_frame object, choice;
+    spa_pod_builder_push_object(b, &object, SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat);
+    spa_pod_builder_add(b,
+        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
+        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw), 0);
+    if (size) {
+        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_format, SPA_POD_Id(x_format), 0);
+        spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY);
+        spa_pod_builder_long(b, static_cast<int64_t>(modifiers[0]));
+        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size, SPA_POD_Rectangle(size), 0);
+    } else {
+        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(3, x_format, x_format, a_format), 0);
+        // Left open (not fixated) so the compositor can pick among the ones it can allocate;
+        // on_param_changed then settles on one.
+        spa_pod_builder_prop(b, SPA_FORMAT_VIDEO_modifier, SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE);
+        spa_pod_builder_push_choice(b, &choice, SPA_CHOICE_Enum, 0);
+        // The default comes first, then every alternative (the default among them).
+        spa_pod_builder_long(b, static_cast<int64_t>(modifiers[0]));
+        for (size_t i = 0; i < count; ++i) spa_pod_builder_long(b, static_cast<int64_t>(modifiers[i]));
+        spa_pod_builder_pop(b, &choice);
+        spa_pod_builder_add(b, SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&def_size, &min_size, &max_size), 0);
+    }
+    spa_pod_builder_add(b, SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&def_rate, &min_rate, &max_rate), 0);
+    return static_cast<const struct spa_pod*>(spa_pod_builder_pop(b, &object));
+}
+
+// Everything we can take, best first: DMA-BUFs the encoder can import, then shared memory.
+// Fills at most 3 entries of `params` and returns how many.
+static uint32_t build_formats(pyromirror_capture_context* ctx, struct spa_pod_builder* b, const struct spa_pod** params) {
+    uint32_t n = 0;
+    if (!ctx->gpu_disabled) {
+        if (!ctx->modifiers_bgrx.empty())
+            params[n++] = build_dmabuf_format(b, SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
+                                              ctx->modifiers_bgrx.data(), ctx->modifiers_bgrx.size(), nullptr);
+        if (!ctx->modifiers_rgbx.empty())
+            params[n++] = build_dmabuf_format(b, SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA,
+                                              ctx->modifiers_rgbx.data(), ctx->modifiers_rgbx.size(), nullptr);
+    }
+    params[n++] = build_shm_format(b);
+    return n;
+}
+
 static void on_param_changed(void* data, uint32_t id, const struct spa_pod* param) {
     auto* ctx = static_cast<pyromirror_capture_context*>(data);
     if (!param || id != SPA_PARAM_Format) return;
@@ -158,23 +253,74 @@ static void on_param_changed(void* data, uint32_t id, const struct spa_pod* para
         fail(ctx, "compositor negotiated an unsupported pixel format");
         return;
     }
+
+    // A modifier in the format means DMA-BUFs. If several are still possible, it is on us to
+    // settle on one and offer that; the format then comes back here with it fixed.
+    const struct spa_pod_prop* modifier = spa_pod_find_prop(param, nullptr, SPA_FORMAT_VIDEO_modifier);
+    if (modifier && (modifier->flags & SPA_POD_PROP_FLAG_DONT_FIXATE) && spa_pod_is_choice(&modifier->value)) {
+        const struct spa_pod* choice = &modifier->value;
+        uint32_t count = SPA_POD_CHOICE_N_VALUES(choice);
+        const uint64_t* values = static_cast<const uint64_t*>(SPA_POD_CHOICE_VALUES(choice));
+        if (count == 0 || SPA_POD_CHOICE_VALUE_SIZE(choice) != sizeof(uint64_t)) {
+            fail(ctx, "compositor offered DMA-BUFs without a usable modifier");
+            return;
+        }
+        // The first value is the default; the alternatives after it are what both sides can do.
+        uint64_t chosen = values[count > 1 ? 1 : 0];
+
+        uint8_t buffer[4096];
+        struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+        const struct spa_pod* params[4];
+        params[0] = build_dmabuf_format(&b, info.format, info.format, &chosen, 1, &info.size);
+        uint32_t n = 1 + build_formats(ctx, &b, params + 1);
+        pw_stream_update_params(ctx->stream, params, n);
+        return;
+    }
+
     ctx->width = info.size.width;
     ctx->height = info.size.height;
+    ctx->dmabuf = modifier != nullptr;
+    ctx->modifier = info.modifier;
 
-    // Ask for buffers we can read from the CPU; without this a compositor may hand out DMA-BUFs,
-    // which are not generally mappable.
     uint8_t buffer[512];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
     const struct spa_pod* params[2];
-    params[0] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
-        SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-        SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
+    if (ctx->dmabuf) {
+        // Two buffers are out of the pool at any time (see `pending` and `held`).
+        params[0] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(8, 4, 32),
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int(1 << SPA_DATA_DmaBuf)));
+    } else {
+        // Buffers we can read from the CPU.
+        params[0] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
+            SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
+            SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
+    }
     // Room for the pointer's picture next to each frame.
     params[1] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
         SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
         SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(CURSOR_META_SIZE(64, 64), CURSOR_META_SIZE(1, 1), CURSOR_META_SIZE(256, 256))));
     pw_stream_update_params(ctx->stream, params, ctx->cursor_metadata ? 2 : 1);
+}
+
+// Each buffer of the pool gets an id that is never used again, so that whoever imported it into
+// another API can tell the buffers apart, and old from new ones.
+static void on_add_buffer(void* data, struct pw_buffer* buffer) {
+    auto* ctx = static_cast<pyromirror_capture_context*>(data);
+    buffer->user_data = reinterpret_cast<void*>(static_cast<uintptr_t>(ctx->next_buffer_id++));
+}
+
+static void on_remove_buffer(void* data, struct pw_buffer* buffer) {
+    auto* ctx = static_cast<pyromirror_capture_context*>(data);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    // The pool is going away (renegotiation, end of stream); nothing to give back.
+    if (ctx->pending == buffer) {
+        ctx->pending = nullptr;
+        ctx->fresh = false;
+    }
+    if (ctx->held == buffer) ctx->held = nullptr;
 }
 
 static void on_process(void* data) {
@@ -194,6 +340,29 @@ static void on_process(void* data) {
     const struct spa_meta_header* header = static_cast<const struct spa_meta_header*>(
         spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(struct spa_meta_header)));
     bool corrupted = header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED);
+
+    if (ctx->dmabuf) {
+        const struct spa_data* d = buf->n_datas > 0 ? &buf->datas[0] : nullptr;
+        // A buffer without a picture (size 0) only carried the pointer.
+        bool usable = !corrupted && !ctx->gpu_disabled && d && buf->n_datas <= 4 && d->type == SPA_DATA_DmaBuf && d->fd >= 0 &&
+                      d->chunk && d->chunk->size > 0 && !(d->chunk->flags & SPA_CHUNK_FLAG_CORRUPTED);
+        if (!usable) {
+            pw_stream_queue_buffer(ctx->stream, newest);
+            return;
+        }
+        std::lock_guard<std::mutex> lock(ctx->mutex);
+        // Kept out of the pool until the caller has encoded it.
+        if (ctx->pending) pw_stream_queue_buffer(ctx->stream, ctx->pending);
+        ctx->pending = newest;
+        ctx->pending_info = {};
+        ctx->pending_info.width = ctx->width;
+        ctx->pending_info.height = ctx->height;
+        ctx->pending_info.format = ctx->format;
+        ctx->pending_info.dmabuf_modifier = ctx->modifier;
+        ctx->fresh = true;
+        ctx->cond.notify_all();
+        return;
+    }
 
     if (!corrupted && buf->n_datas > 0 && ctx->width > 0 && ctx->height > 0) {
         const struct spa_data* d = &buf->datas[0];
@@ -221,27 +390,6 @@ static void on_process(void* data) {
     pw_stream_queue_buffer(ctx->stream, newest);
 }
 
-static const struct spa_pod* build_format(struct spa_pod_builder* b) {
-    struct spa_rectangle def_size = SPA_RECTANGLE(1920, 1080);
-    struct spa_rectangle min_size = SPA_RECTANGLE(1, 1);
-    struct spa_rectangle max_size = SPA_RECTANGLE(16384, 16384);
-    struct spa_fraction def_rate = SPA_FRACTION(60, 1);
-    struct spa_fraction min_rate = SPA_FRACTION(0, 1);
-    struct spa_fraction max_rate = SPA_FRACTION(1000, 1);
-
-    // No SPA_FORMAT_VIDEO_modifier property: that restricts negotiation to shared-memory buffers.
-    return static_cast<const struct spa_pod*>(spa_pod_builder_add_object(b,
-        SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
-        SPA_FORMAT_mediaType, SPA_POD_Id(SPA_MEDIA_TYPE_video),
-        SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_raw),
-        SPA_FORMAT_VIDEO_format, SPA_POD_CHOICE_ENUM_Id(5,
-            SPA_VIDEO_FORMAT_BGRx,
-            SPA_VIDEO_FORMAT_BGRx, SPA_VIDEO_FORMAT_BGRA,
-            SPA_VIDEO_FORMAT_RGBx, SPA_VIDEO_FORMAT_RGBA),
-        SPA_FORMAT_VIDEO_size, SPA_POD_CHOICE_RANGE_Rectangle(&def_size, &min_size, &max_size),
-        SPA_FORMAT_VIDEO_framerate, SPA_POD_CHOICE_RANGE_Fraction(&def_rate, &min_rate, &max_rate)));
-}
-
 static void destroy(pyromirror_capture_context* ctx) {
     if (ctx->loop) pw_thread_loop_stop(ctx->loop);
     if (ctx->stream) pw_stream_destroy(ctx->stream);
@@ -264,6 +412,10 @@ extern "C" pyromirror_capture_context* pyromirror_capture_create(const pyromirro
 
     auto* ctx = new pyromirror_capture_context();
     ctx->cursor_metadata = config->cursor_metadata;
+    if (config->dmabuf_modifiers_bgrx)
+        ctx->modifiers_bgrx.assign(config->dmabuf_modifiers_bgrx, config->dmabuf_modifiers_bgrx + config->dmabuf_modifiers_bgrx_count);
+    if (config->dmabuf_modifiers_rgbx)
+        ctx->modifiers_rgbx.assign(config->dmabuf_modifiers_rgbx, config->dmabuf_modifiers_rgbx + config->dmabuf_modifiers_rgbx_count);
     int fd = config->pipewire_fd;
 
     ctx->loop = pw_thread_loop_new("pyromirror-pw", nullptr);
@@ -302,16 +454,19 @@ extern "C" pyromirror_capture_context* pyromirror_capture_create(const pyromirro
     ctx->events.version = PW_VERSION_STREAM_EVENTS;
     ctx->events.state_changed = on_state_changed;
     ctx->events.param_changed = on_param_changed;
+    ctx->events.add_buffer = on_add_buffer;
+    ctx->events.remove_buffer = on_remove_buffer;
     ctx->events.process = on_process;
     pw_stream_add_listener(ctx->stream, &ctx->stream_listener, &ctx->events, ctx);
 
-    uint8_t buffer[1024];
+    uint8_t buffer[4096];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod* params[1] = { build_format(&b) };
+    const struct spa_pod* params[3];
+    uint32_t num_params = build_formats(ctx, &b, params);
 
     int res = pw_stream_connect(ctx->stream, PW_DIRECTION_INPUT, config->pipewire_node,
         static_cast<enum pw_stream_flags>(PW_STREAM_FLAG_AUTOCONNECT | PW_STREAM_FLAG_MAP_BUFFERS),
-        params, 1);
+        params, num_params);
     pw_thread_loop_unlock(ctx->loop);
 
     if (res < 0) {
@@ -331,6 +486,46 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
     ctx->cond.wait_for(lock, std::chrono::milliseconds(timeout_ms), [&] { return ctx->fresh || ctx->failed; });
     if (ctx->failed) return PYROMIRROR_CAPTURE_ERROR;
     if (!ctx->fresh) return PYROMIRROR_CAPTURE_NO_FRAME;
+
+    if (ctx->pending) {
+        // Buffers go back to the compositor with the PipeWire loop locked, which has to be taken
+        // before `mutex`: the PipeWire thread holds it when it takes `mutex`.
+        lock.unlock();
+        pw_thread_loop_lock(ctx->loop);
+        lock.lock();
+        if (ctx->held) pw_stream_queue_buffer(ctx->stream, ctx->held);
+        ctx->held = ctx->pending;
+        ctx->pending = nullptr;
+        ctx->fresh = false;
+        if (!ctx->held) {
+            // The pool was replaced while we were getting here.
+            lock.unlock();
+            pw_thread_loop_unlock(ctx->loop);
+            return PYROMIRROR_CAPTURE_NO_FRAME;
+        }
+        *out_frame = ctx->pending_info;
+        const struct spa_buffer* buf = ctx->held->buffer;
+        out_frame->gpu_texture = static_cast<uint64_t>(reinterpret_cast<uintptr_t>(ctx->held->user_data));
+        out_frame->dmabuf_fd = static_cast<int32_t>(buf->datas[0].fd);
+        out_frame->dmabuf_planes = buf->n_datas;
+        for (uint32_t i = 0; i < buf->n_datas && i < 4; ++i) {
+            out_frame->dmabuf_offsets[i] = buf->datas[i].chunk->offset;
+            out_frame->dmabuf_strides[i] = static_cast<uint32_t>(buf->datas[i].chunk->stride);
+        }
+        out_frame->stride = out_frame->dmabuf_strides[0];
+        lock.unlock();
+        pw_thread_loop_unlock(ctx->loop);
+
+        // The buffer is ours now, but the compositor may still be drawing into it. That is over
+        // when the buffer becomes readable, which is the two sides taking turns: nothing else
+        // synchronises them.
+        auto start = std::chrono::steady_clock::now();
+        struct pollfd pfd = { out_frame->dmabuf_fd, POLLIN, 0 };
+        while (poll(&pfd, 1, 100) < 0 && errno == EINTR) {}
+        out_frame->prepare_us = static_cast<uint32_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - start).count());
+        return PYROMIRROR_CAPTURE_FRAME;
+    }
 
     ctx->front.swap(ctx->back);
     ctx->fresh = false;
@@ -360,9 +555,36 @@ extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context*, int32
     return false;
 }
 
-// Frames arrive as shared memory here; there is no GPU texture to hand out.
-extern "C" bool pyromirror_capture_set_gpu(pyromirror_capture_context*, bool) {
-    return false;
+extern "C" bool pyromirror_capture_set_gpu(pyromirror_capture_context* ctx, bool enable) {
+    if (!ctx) return false;
+    pw_thread_loop_lock(ctx->loop);
+    bool result;
+    if (enable) {
+        // Settled when the stream was negotiated; there is nothing to switch on.
+        result = ctx->dmabuf && !ctx->gpu_disabled;
+    } else {
+        result = true;
+        if (!ctx->gpu_disabled) {
+            ctx->gpu_disabled = true;
+            {
+                std::lock_guard<std::mutex> lock(ctx->mutex);
+                if (ctx->held) pw_stream_queue_buffer(ctx->stream, ctx->held);
+                if (ctx->pending) pw_stream_queue_buffer(ctx->stream, ctx->pending);
+                if (ctx->pending) ctx->fresh = false;
+                ctx->held = ctx->pending = nullptr;
+            }
+            if (ctx->dmabuf) {
+                // Negotiate again, offering shared memory only.
+                uint8_t buffer[1024];
+                struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
+                const struct spa_pod* params[3];
+                uint32_t n = build_formats(ctx, &b, params);
+                pw_stream_update_params(ctx->stream, params, n);
+            }
+        }
+    }
+    pw_thread_loop_unlock(ctx->loop);
+    return result;
 }
 
 extern "C" uintptr_t pyromirror_capture_export_texture(pyromirror_capture_context*) {

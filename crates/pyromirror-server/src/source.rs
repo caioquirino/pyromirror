@@ -2,7 +2,7 @@
 
 use std::time::{Duration, Instant};
 
-use anyhow::{anyhow, bail};
+use anyhow::bail;
 use pyromirror_capture::{Capturer, PixelFormat as CaptureFormat};
 use pyromirror_codec::PixelFormat;
 
@@ -15,6 +15,8 @@ pub struct SourceFrame<'a> {
     /// Set when the image stayed on the GPU: `data` is empty, the size is the desktop's (not
     /// scaled), and the encoder reads the capturer's texture with this id.
     pub texture: Option<u64>,
+    /// Linux: the DMA-BUF that texture is.
+    pub dmabuf: Option<pyromirror_capture::DmaBuf>,
     /// Time spent preparing the frame: reading it back and shrinking it, or the GPU copy.
     pub prepare: Duration,
 }
@@ -100,6 +102,7 @@ impl Source {
                         CaptureFormat::Rgbx => PixelFormat::Rgbx,
                     },
                     texture: frame.texture,
+                    dmabuf: frame.dmabuf,
                     prepare: frame.prepare,
                 }),
                 Err(e) => {
@@ -116,28 +119,10 @@ impl Source {
                 let start = Instant::now();
                 let (width, height) = downscale(&frame, *scale as usize, scaled);
                 let prepare = frame.prepare + start.elapsed();
-                Some(SourceFrame { data: scaled, width, height, stride: width * 4, format: frame.format, texture: None, prepare })
+                Some(SourceFrame { data: scaled, width, height, stride: width * 4, format: frame.format, texture: None, dmabuf: None, prepare })
             }
             other => other,
         })
-    }
-
-    /// Blocks until the first frame arrives (which is what reveals the desktop resolution) and
-    /// passes it to `f`.
-    pub fn with_first_frame<R>(
-        &mut self,
-        timeout: Duration,
-        f: impl FnOnce(&SourceFrame<'_>) -> anyhow::Result<R>,
-    ) -> anyhow::Result<R> {
-        let deadline = Instant::now() + timeout;
-        loop {
-            if let Some(frame) = self.next_frame(Duration::from_millis(100))? {
-                return f(&frame);
-            }
-            if Instant::now() >= deadline {
-                return Err(anyhow!("no frame arrived from the capture backend within {:?}", timeout));
-            }
-        }
     }
 }
 
@@ -181,6 +166,7 @@ impl TestPattern {
             stride: self.width * 4,
             format: PixelFormat::Rgbx,
             texture: None,
+            dmabuf: None,
             prepare: Duration::ZERO,
         }
     }
@@ -241,7 +227,7 @@ mod tests {
                 data[y * stride + x * 4..][..4].copy_from_slice(&[v, v / 2, 7, 0]);
             }
         }
-        let frame = SourceFrame { data: &data, width: 5, height: 4, stride: stride as u32, format: PixelFormat::Bgrx, texture: None, prepare: Duration::ZERO };
+        let frame = SourceFrame { data: &data, width: 5, height: 4, stride: stride as u32, format: PixelFormat::Bgrx, texture: None, dmabuf: None, prepare: Duration::ZERO };
         let mut out = Vec::new();
         assert_eq!(downscale(&frame, 2, &mut out), (2, 2));
         assert_eq!(out.len(), 2 * 2 * 4);

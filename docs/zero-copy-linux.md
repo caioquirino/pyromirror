@@ -1,8 +1,11 @@
-# Zero-copy on Linux: spec
+# Zero-copy on Linux
 
-Status: not started. Windows is done and measured; this document is what is needed to do the
-same on a Linux machine with a real GPU. It cannot be developed in WSL or in `docker/demo`:
-neither has a GPU that hands out DMA-BUFs.
+Status: both sides work on the one machine they were built on (AMD Radeon 890M, Mesa 26.2
+RADV and radeonsi, KDE Plasma on Wayland, PipeWire 1.6). Not yet tried: GNOME, NVIDIA's
+proprietary driver, a laptop with two GPUs. See "What exists (Linux)" and "Still open" below;
+the two "Part" sections are the original spec, kept for the reasoning.
+
+It cannot be developed in WSL or in `docker/demo`: neither has a GPU that hands out DMA-BUFs.
 
 ## What "zero-copy" means here
 
@@ -43,6 +46,59 @@ Two rules the Windows code follows, which Linux should keep:
    of a millisecond and removes a whole class of bugs.
 2. **Everything falls back.** If the device, the import or an encode/decode fails, a warning is
    logged and the old path carries on, starting from the same image.
+
+## What exists (Linux)
+
+Measured on the development machine, 1920x1200 at 60 fps, 250 Mbps, 4:4:4:
+
+| Side | Before | Zero-copy |
+| :--- | :--- | :--- |
+| Sharing (convert + encode; the compositor's readback is not in the "before") | 5.2 to 6.4 ms per frame | about 3.3 ms (0.3 ms waiting for the compositor + 3.0 ms encode) |
+| Viewing (decode + convert + upload) | about 8 ms per frame | about 1.3 to 2 ms, no upload |
+
+How it is built:
+
+| Piece | Where | What it does |
+| :--- | :--- | :--- |
+| Glue | `crates/pyrowave-sys/src/glue.c` | `pm_dmabuf_modifiers` (what the device can import, asked through the Vulkan loader PyroWave already loaded), `pm_gpu_image_import_dmabuf`, `pm_gpu_fence_create`, `pm_device_drm_render_node`. Imported DMA-BUFs are acquired from and released to `VK_QUEUE_FAMILY_FOREIGN_EXT`. |
+| Codec | `crates/pyromirror-codec/src/lib.rs` | `TextureHandle::DmaBuf`; the encoder keeps its imported textures in a map by id; `Device::dmabuf_modifiers` / `dmabuf_plane_modifiers` / `drm_render_node`; `Decoder::create_gpu_fence`. |
+| Capture | `crates/pyromirror-capture/src/capture_linux.cpp`, `lib.rs` | Offers DMA-BUF formats with the encoder's modifiers ahead of shared memory, settles on one modifier, keeps the newest buffer out of the pool while it is encoded, and waits for the compositor with `poll()`. `Frame::dmabuf` describes the buffer; `Frame::texture` is an id that is never reused. |
+| Server | `crates/pyromirror-server/src/main.rs` | Creates the device before capture, encodes the first frame from a DMA-BUF too, imports each buffer of the pool the first time it comes by. |
+| Viewer | `crates/pyromirror-client/src/gpu_present_linux.rs`, `dmabuf_planes.c` | Design A below: three sets of single-channel GBM buffers, imported into Vulkan as decode targets and into OpenGL as EGL images, drawn by SDL as one "IYUV" texture. EGL and GBM are loaded at run time, so the viewer gained no dependency. |
+
+What was learned on the way:
+
+- **Storage writes to an imported single-channel DMA-BUF work** on RADV, which was the open
+  question of design A. Design B was not needed.
+- **SDL gives a texture it is handed storage of its own** (`glTexImage2D`), which would detach
+  the EGL image. The image is therefore bound after SDL has wrapped the texture.
+- **A fence of PyroWave's own** needs `VK_SEMAPHORE_IMPORT_TEMPORARY_BIT` set even though
+  nothing is imported; without it `pyrowave_sync_object_create` returns "invalid argument".
+- **Falling back on the sharing side renegotiates the stream** to shared memory
+  (`pw_stream_update_params` without the DMA-BUF formats). KWin sends a frame right after, so
+  the picture is there at once; the encoder is not left with a stale one.
+- **Zero-copy display needs OpenGL on EGL.** Under X11, SDL uses GLX and the viewer converts
+  on the CPU as before (logged at debug level, not as a warning).
+- Buffers are imported the first time they are seen rather than in `add_buffer`: the import
+  happens on the encoding thread, and ids that never repeat make stale imports harmless.
+
+## Still open
+
+- **GNOME**, and any compositor other than KWin. Things that may differ: how pointer-only
+  buffers are marked (a chunk of size 0 or the `CORRUPTED` flag is skipped), and whether a frame
+  follows a renegotiation.
+- **NVIDIA's proprietary driver**: `poll()` may return at once (no implicit sync) and frames
+  could tear; the sync-file route of step 5 is not implemented.
+- **Two GPUs.** The server uses the default device and does not check that the compositor
+  renders on it. The viewer does compare render nodes (`VK_EXT_physical_device_drm` against
+  EGL's device) and falls back on a mismatch, but that path has not run on real hardware.
+- **Modifiers with more than one memory plane** on the sharing side are passed through as
+  PipeWire reports them, assuming all planes are in the first buffer's fd. Not seen in practice.
+- **`docker/demo`** was not re-run. It has no DMA-BUFs, so it takes the shared-memory path,
+  which `--no-zero-copy` and a forced import failure exercised here.
+- **NV12** from the compositor: not offered.
+- The menu, pointer and fullscreen were not checked by hand with the zero-copy display, only
+  that the window's contents (`--dump-window`, also fullscreen) are right.
 
 PyroWave's own interop test (`submodules/pyrowave/pyrowave_c_interop_test.cpp`) is the reference
 for every import; it has DMA-BUF cases next to the Direct3D ones.

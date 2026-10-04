@@ -17,8 +17,8 @@ use clap::{Parser, ValueEnum};
 use log::{debug, error, info, trace, warn};
 
 use pyromirror_audio::AudioCapture;
-use pyromirror_capture::{CaptureOptions, Capturer, InputInjector};
-use pyromirror_codec::{Chroma, Device, Encoder, Packets, TextureHandle};
+use pyromirror_capture::{CaptureOptions, Capturer, DmaBuf, DmaBufModifiers, InputInjector};
+use pyromirror_codec::{Chroma, Device, DmaBufPlanes, Encoder, Packets, TextureHandle};
 use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::control::{Listener, Side, Toggles};
@@ -133,7 +133,7 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
 struct Pipeline {
     source: Source,
     encoder: Encoder,
-    /// The capture texture the encoder has imported, while frames stay on the GPU.
+    /// The capture texture the encoder imported last, while frames stay on the GPU.
     imported_texture: Option<u64>,
     max_frame_bytes: usize,
     packet_boundary: usize,
@@ -205,6 +205,16 @@ struct TextureFrame {
     width: u32,
     height: u32,
     format: pyromirror_codec::PixelFormat,
+    /// Linux: the DMA-BUF the frame is in.
+    dmabuf: Option<DmaBuf>,
+}
+
+impl TextureFrame {
+    /// What `frame` needs for encoding, if it stayed on the GPU.
+    fn of(frame: &SourceFrame<'_>) -> Option<Self> {
+        let id = frame.texture?;
+        Some(Self { id, width: frame.width, height: frame.height, format: frame.format, dmabuf: frame.dmabuf })
+    }
 }
 
 /// Encodes straight from the capture texture. `None` means that did not work: zero-copy has
@@ -225,14 +235,27 @@ fn encode_texture<'e>(
     }
 
     let mut attempt = || -> anyhow::Result<()> {
-        if *imported != Some(frame.id) {
-            *imported = None;
-            let handle = source.export_texture().context("the capture texture could not be shared")?;
-            encoder.import_texture(TextureHandle::D3d11(handle), frame.width, frame.height, frame.format)?;
-            *imported = Some(frame.id);
-            info!("Zero-copy capture: encoding straight from the {}x{} desktop texture", frame.width, frame.height);
+        if !encoder.has_texture(frame.id) {
+            let handle = match frame.dmabuf {
+                // One of the few buffers the compositor cycles through; each is imported the
+                // first time it comes by.
+                Some(d) => {
+                    let layout = DmaBufPlanes { modifier: d.modifier, planes: d.planes, offsets: d.offsets, strides: d.strides };
+                    TextureHandle::DmaBuf { fd: d.fd, layout }
+                }
+                // One shared texture, which was replaced as a whole.
+                None => {
+                    *imported = None;
+                    encoder.drop_textures();
+                    TextureHandle::D3d11(source.export_texture().context("the capture texture could not be shared")?)
+                }
+            };
+            encoder.import_texture(frame.id, handle, frame.width, frame.height, frame.format)?;
+            if imported.replace(frame.id).is_none() {
+                info!("Zero-copy capture: encoding straight from the {}x{} desktop texture", frame.width, frame.height);
+            }
         }
-        encoder.encode_texture(max_frame_bytes, packet_boundary)?;
+        encoder.encode_texture(frame.id, max_frame_bytes, packet_boundary)?;
         Ok(())
     };
     match attempt() {
@@ -240,7 +263,7 @@ fn encode_texture<'e>(
         Err(e) => {
             warn!("Zero-copy capture failed ({:#}); reading frames back from the GPU instead", e);
             *imported = None;
-            encoder.drop_texture();
+            encoder.drop_textures();
             source.set_gpu_frames(false);
             Ok(None)
         }
@@ -248,7 +271,12 @@ fn encode_texture<'e>(
 }
 
 fn main() -> anyhow::Result<()> {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    // The D-Bus library logs its own workings at info level, and warns about portal objects
+    // that are gone by the time it looks; neither is ours to report.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("zbus", log::LevelFilter::Error)
+        .filter_module("tracing", log::LevelFilter::Error)
+        .init();
     let args = Args::parse();
     pyromirror_capture::init_process();
 
@@ -261,6 +289,24 @@ fn main() -> anyhow::Result<()> {
         ChromaArg::C420 => Chroma::C420,
     };
 
+    // Linux: the device has to say which DMA-BUFs it can import before capture is negotiated
+    // with the compositor. (Windows goes the other way round: the device follows the adapter
+    // that captures.)
+    #[cfg(target_os = "linux")]
+    let (early_device, dmabuf) = {
+        let device = Device::new().context("could not initialise PyroWave")?;
+        let wanted = !args.no_zero_copy && args.test_pattern.is_none() && device.supports_texture_import();
+        let modifiers = wanted
+            .then(|| DmaBufModifiers {
+                bgrx: device.dmabuf_modifiers(pyromirror_codec::PixelFormat::Bgrx),
+                rgbx: device.dmabuf_modifiers(pyromirror_codec::PixelFormat::Rgbx),
+            })
+            .filter(|m| !m.bgrx.is_empty() || !m.rgbx.is_empty());
+        (Some(device), modifiers)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let (early_device, dmabuf): (Option<Arc<Device>>, Option<DmaBufModifiers>) = (None, None);
+
     let mut injector = None;
     let mut capture_adapter = None;
     let mut source = match args.test_pattern {
@@ -270,7 +316,7 @@ fn main() -> anyhow::Result<()> {
         }
         None => {
             let capturer =
-                Capturer::new(&CaptureOptions { output: args.monitor }).context("could not start desktop capture")?;
+                Capturer::new(&CaptureOptions { output: args.monitor, dmabuf }).context("could not start desktop capture")?;
             capture_adapter = capturer.adapter_luid();
             if !args.no_input {
                 injector = capturer.input_injector();
@@ -284,19 +330,21 @@ fn main() -> anyhow::Result<()> {
     .with_scale(args.scale);
 
     // Frames can stay on the GPU only if the encoder runs on the adapter that captures them.
-    let (device, mut zero_copy) = match capture_adapter.filter(|_| !args.no_zero_copy).map(Device::on_adapter) {
-        Some(Ok(device)) => {
+    let (device, mut zero_copy) = match (early_device, capture_adapter.filter(|_| !args.no_zero_copy).map(Device::on_adapter)) {
+        // Whether frames stay on the GPU was settled when capture started; asked below.
+        (Some(device), _) => (device, !args.no_zero_copy),
+        (None, Some(Ok(device))) => {
             let usable = device.supports_texture_import();
             if !usable {
                 info!("The graphics driver cannot share textures; frames will be read back from the GPU");
             }
             (device, usable)
         }
-        Some(Err(e)) => {
+        (None, Some(Err(e))) => {
             debug!("No PyroWave device on the capture adapter ({}); using the default one", e);
             (Device::new().context("could not initialise PyroWave")?, false)
         }
-        None => (Device::new().context("could not initialise PyroWave")?, false),
+        (None, None) => (Device::new().context("could not initialise PyroWave")?, false),
     };
 
     let max_frame_bytes = (args.bitrate_mbps as usize * 1_000_000 / 8) / args.fps as usize;
@@ -304,11 +352,22 @@ fn main() -> anyhow::Result<()> {
 
     // The first frame tells us the desktop resolution. It is also encoded once, which leaves it
     // in the encoder so an idle desktop can be sent to the first client right away.
-    let encoder = source.with_first_frame(Duration::from_secs(10), |first| {
+    let mut imported_texture = None;
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let encoder = loop {
+        let Some(first) = source.next_frame(Duration::from_millis(100))? else {
+            if Instant::now() >= deadline {
+                bail!("no frame arrived from the capture backend within 10 seconds");
+            }
+            continue;
+        };
+        // A frame that stayed on the GPU is the whole desktop; the encoder shrinks it.
+        let texture = TextureFrame::of(&first);
+        let shrink = if texture.is_some() { args.scale } else { 1 };
         // 4:2:0 needs even dimensions; crop the odd row/column if there is one.
         let (w, h) = match chroma {
-            Chroma::C444 => (first.width, first.height),
-            Chroma::C420 => (first.width & !1, first.height & !1),
+            Chroma::C444 => (first.width / shrink, first.height / shrink),
+            Chroma::C420 => (first.width / shrink & !1, first.height / shrink & !1),
         };
         if w < 16 || h < 16 {
             bail!("--scale {} leaves only {}x{} pixels", args.scale, w, h);
@@ -316,14 +375,25 @@ fn main() -> anyhow::Result<()> {
         if w > u16::MAX as u32 || h > u16::MAX as u32 {
             bail!("desktop of {}x{} is larger than the protocol supports", w, h);
         }
-        let mut encoder = Encoder::new(device, w, h, chroma).context("could not create the PyroWave encoder")?;
-        encode_frame(&mut encoder, first, max_frame_bytes, boundary)?;
-        Ok(encoder)
-    })?;
+        let mut encoder = Encoder::new(device.clone(), w, h, chroma).context("could not create the PyroWave encoder")?;
+        match texture {
+            None => {
+                encode_frame(&mut encoder, &first, max_frame_bytes, boundary)?;
+                break encoder;
+            }
+            // Linux, where frames are on the GPU from the start. If the encoder cannot take
+            // them, capture switches to pixels and the next frame is the first one.
+            Some(texture) => {
+                if encode_texture(&mut source, &mut encoder, &mut imported_texture, texture, max_frame_bytes, boundary)?.is_some() {
+                    break encoder;
+                }
+            }
+        }
+    };
     let (width, height) = (encoder.width(), encoder.height());
 
-    // From here on frames stay on the GPU where that is possible. The first one above came as
-    // pixels either way, which is what a fallback has to start from.
+    // From here on frames stay on the GPU where that is possible. On Windows the first one above
+    // came as pixels either way, which is what a fallback has to start from.
     zero_copy = zero_copy && source.set_gpu_frames(true);
     if !zero_copy && !args.no_zero_copy {
         debug!("Zero-copy capture is not available here; frames are read back and converted on the CPU");
@@ -398,7 +468,7 @@ fn main() -> anyhow::Result<()> {
     let mut pipeline = Pipeline {
         source,
         encoder,
-        imported_texture: None,
+        imported_texture,
         max_frame_bytes,
         packet_boundary: boundary,
         frame_interval: Duration::from_secs_f64(1.0 / args.fps as f64),
@@ -677,10 +747,9 @@ fn stream_video(
         let packets = match frame {
             Some(frame) => {
                 prepare = frame.prepare;
-                match frame.texture {
-                    Some(id) => {
+                match TextureFrame::of(&frame) {
+                    Some(texture) => {
                         on_gpu = true;
-                        let texture = TextureFrame { id, width: frame.width, height: frame.height, format: frame.format };
                         encode_texture(source, encoder, imported_texture, texture, max_frame_bytes, packet_boundary)?
                     }
                     None => Some(encode_frame(encoder, &frame, max_frame_bytes, packet_boundary)?),

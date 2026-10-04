@@ -14,7 +14,7 @@ use pyromirror_net::create_streaming_socket;
 /// Runs the checks. The launcher looks for the "Permission check" lines.
 pub fn check(bind: SocketAddr, monitor: Option<u32>, want_input: bool) -> anyhow::Result<()> {
     info!("Permission check: asking the desktop for access (look for a dialog)");
-    let mut capturer = Capturer::new(&CaptureOptions { output: monitor }).context("screen capture was not allowed")?;
+    let mut capturer = Capturer::new(&CaptureOptions { output: monitor, dmabuf: None }).context("screen capture was not allowed")?;
 
     // Seeing a frame proves the grant actually works, not just that a dialog was answered.
     let deadline = std::time::Instant::now() + Duration::from_secs(10);
