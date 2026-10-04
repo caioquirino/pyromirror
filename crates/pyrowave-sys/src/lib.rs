@@ -1,7 +1,8 @@
 //! Raw FFI bindings to the PyroWave C API (`submodules/pyrowave/pyrowave.h`, API 0.6).
 //!
-//! Only the device, encoder and decoder entry points that work on CPU buffers are bound. The
-//! external-memory (zero-copy GPU) entry points take Vulkan types and are not bound yet.
+//! The device, encoder and decoder entry points that work on CPU buffers are bound directly. The
+//! external-memory (zero-copy GPU) entry points take Vulkan types; they are reached through the
+//! small C helpers in `glue.c` (`pm_*`), which need none on this side.
 
 #![allow(non_camel_case_types)]
 
@@ -90,6 +91,40 @@ pub struct pyrowave_cpu_buffer {
     pub width: c_int,
     pub height: c_int,
     pub format: pyrowave_cpu_buffer_format,
+}
+
+/// An imported GPU texture, ready to encode from (see `glue.c`).
+#[repr(C)]
+pub struct pm_gpu_image {
+    _private: [u8; 0],
+}
+
+/// `handle_kind`: the NT handle of a shared `ID3D11Texture2D`.
+pub const PM_HANDLE_D3D11_TEXTURE: c_int = 0;
+pub const PM_FORMAT_BGRA8: c_int = 0;
+pub const PM_FORMAT_RGBA8: c_int = 1;
+pub const PM_FORMAT_RGBA16F: c_int = 2;
+
+extern "C" {
+    pub fn pm_create_device_for_luid(luid: *const u8, device: *mut pyrowave_device) -> pyrowave_result;
+    pub fn pm_gpu_image_import(
+        device: pyrowave_device,
+        handle: usize,
+        handle_kind: c_int,
+        width: u32,
+        height: u32,
+        format: c_int,
+        out: *mut *mut pm_gpu_image,
+    ) -> pyrowave_result;
+    pub fn pm_gpu_image_encode(
+        encoder: pyrowave_encoder,
+        image: *mut pm_gpu_image,
+        exact_size: bool,
+        maximum_bitstream_size: usize,
+    ) -> pyrowave_result;
+    pub fn pm_gpu_image_destroy(image: *mut pm_gpu_image);
+
+    pub fn pyrowave_device_confirm_interop_support(device: pyrowave_device) -> bool;
 }
 
 extern "C" {

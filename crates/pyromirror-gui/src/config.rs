@@ -64,6 +64,8 @@ pub struct Config {
     pub require_pairing: bool,
     pub mtu: u32,
     pub pace_factor: f64,
+    /// Encode straight from the captured texture where the system can.
+    pub zero_copy: bool,
 
     // Startup
     /// Start in the tray when the user logs in.
@@ -93,6 +95,7 @@ impl Default for Config {
             require_pairing: true,
             mtu: 1400,
             pace_factor: 2.0,
+            zero_copy: true,
             autostart: false,
             auto_share: false,
         }
@@ -176,6 +179,9 @@ impl Config {
         }
         if !self.require_pairing {
             args.push("--no-pairing".into());
+        }
+        if !self.zero_copy {
+            args.push("--no-zero-copy".into());
         }
         args
     }

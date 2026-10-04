@@ -360,6 +360,19 @@ extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context*, int32
     return false;
 }
 
+// Frames arrive as shared memory here; there is no GPU texture to hand out.
+extern "C" bool pyromirror_capture_set_gpu(pyromirror_capture_context*, bool) {
+    return false;
+}
+
+extern "C" uintptr_t pyromirror_capture_export_texture(pyromirror_capture_context*) {
+    return 0;
+}
+
+extern "C" bool pyromirror_capture_get_adapter_luid(pyromirror_capture_context*, uint8_t*) {
+    return false;
+}
+
 extern "C" bool pyromirror_capture_hdr_active(pyromirror_capture_context*) {
     return false;
 }

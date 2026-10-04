@@ -12,6 +12,11 @@ pub struct SourceFrame<'a> {
     pub height: u32,
     pub stride: u32,
     pub format: PixelFormat,
+    /// Set when the image stayed on the GPU: `data` is empty, the size is the desktop's (not
+    /// scaled), and the encoder reads the capturer's texture with this id.
+    pub texture: Option<u64>,
+    /// Time spent preparing the frame: reading it back and shrinking it, or the GPU copy.
+    pub prepare: Duration,
 }
 
 enum Kind {
@@ -47,6 +52,22 @@ impl Source {
         self.scale
     }
 
+    /// Asks for frames to stay on the GPU. False where the source cannot do that.
+    pub fn set_gpu_frames(&mut self, enable: bool) -> bool {
+        match &mut self.kind {
+            Kind::Capture(capturer) => capturer.set_gpu_frames(enable),
+            Kind::Pattern(_) => false,
+        }
+    }
+
+    /// A new handle to the texture GPU frames are in; the caller owns it.
+    pub fn export_texture(&mut self) -> Option<usize> {
+        match &mut self.kind {
+            Kind::Capture(capturer) => capturer.export_texture(),
+            Kind::Pattern(_) => None,
+        }
+    }
+
     /// The desktop pointer, if it changed since the one with serial `known`.
     pub fn cursor(&mut self, known: Option<u64>) -> Option<pyromirror_capture::Cursor> {
         match &mut self.kind {
@@ -78,6 +99,8 @@ impl Source {
                         CaptureFormat::Bgrx => PixelFormat::Bgrx,
                         CaptureFormat::Rgbx => PixelFormat::Rgbx,
                     },
+                    texture: frame.texture,
+                    prepare: frame.prepare,
                 }),
                 Err(e) => {
                     *lost = true;
@@ -88,9 +111,12 @@ impl Source {
         };
 
         Ok(match frame {
-            Some(frame) if *scale > 1 => {
+            // A frame on the GPU is shrunk there, by the encoder.
+            Some(frame) if *scale > 1 && frame.texture.is_none() => {
+                let start = Instant::now();
                 let (width, height) = downscale(&frame, *scale as usize, scaled);
-                Some(SourceFrame { data: scaled, width, height, stride: width * 4, format: frame.format })
+                let prepare = frame.prepare + start.elapsed();
+                Some(SourceFrame { data: scaled, width, height, stride: width * 4, format: frame.format, texture: None, prepare })
             }
             other => other,
         })
@@ -154,6 +180,8 @@ impl TestPattern {
             height: self.height,
             stride: self.width * 4,
             format: PixelFormat::Rgbx,
+            texture: None,
+            prepare: Duration::ZERO,
         }
     }
 }
@@ -213,7 +241,7 @@ mod tests {
                 data[y * stride + x * 4..][..4].copy_from_slice(&[v, v / 2, 7, 0]);
             }
         }
-        let frame = SourceFrame { data: &data, width: 5, height: 4, stride: stride as u32, format: PixelFormat::Bgrx };
+        let frame = SourceFrame { data: &data, width: 5, height: 4, stride: stride as u32, format: PixelFormat::Bgrx, texture: None, prepare: Duration::ZERO };
         let mut out = Vec::new();
         assert_eq!(downscale(&frame, 2, &mut out), (2, 2));
         assert_eq!(out.len(), 2 * 2 * 4);

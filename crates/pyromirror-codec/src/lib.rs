@@ -72,19 +72,40 @@ unsafe impl Send for Device {}
 unsafe impl Sync for Device {}
 
 impl Device {
-    pub fn new() -> Result<Arc<Self>, CodecError> {
+    fn check_api() -> Result<(), CodecError> {
         let (mut major, mut minor, mut patch) = (0u32, 0u32, 0u32);
         unsafe { sys::pyrowave_get_api_version(&mut major, &mut minor, &mut patch) };
         if major != sys::PYROWAVE_API_VERSION_MAJOR || minor != sys::PYROWAVE_API_VERSION_MINOR {
             return Err(CodecError::ApiMismatch { major, minor });
         }
+        Ok(())
+    }
 
+    pub fn new() -> Result<Arc<Self>, CodecError> {
+        Self::check_api()?;
         let mut raw = std::ptr::null_mut();
         let code = unsafe { sys::pyrowave_create_default_device(&mut raw) };
         if code != sys::PYROWAVE_SUCCESS || raw.is_null() {
             return Err(CodecError::NoDevice(code));
         }
         Ok(Arc::new(Self { raw }))
+    }
+
+    /// A device on the graphics adapter with this LUID (Windows). Textures can only be shared
+    /// with whatever else runs on the same adapter, such as desktop capture.
+    pub fn on_adapter(luid: [u8; 8]) -> Result<Arc<Self>, CodecError> {
+        Self::check_api()?;
+        let mut raw = std::ptr::null_mut();
+        let code = unsafe { sys::pm_create_device_for_luid(luid.as_ptr(), &mut raw) };
+        if code != sys::PYROWAVE_SUCCESS || raw.is_null() {
+            return Err(CodecError::NoDevice(code));
+        }
+        Ok(Arc::new(Self { raw }))
+    }
+
+    /// Whether the driver can import textures from other graphics APIs at all.
+    pub fn supports_texture_import(&self) -> bool {
+        unsafe { sys::pyrowave_device_confirm_interop_support(self.raw) }
     }
 
     /// True on GPUs with weak compute support (most mobile chips).
@@ -164,7 +185,30 @@ pub struct Encoder {
     bitstream: Vec<u8>,
     packets: Vec<sys::pyrowave_packet>,
     num_packets: usize,
-    _device: Arc<Device>,
+    /// A texture owned by another graphics API, to encode from without copying.
+    texture: Option<Texture>,
+    /// Where the most recent frame came from, for `encode_last`.
+    last_from_texture: bool,
+    device: Arc<Device>,
+}
+
+struct Texture {
+    raw: *mut sys::pm_gpu_image,
+    /// Same size as the encoder, so no scaling is needed.
+    exact_size: bool,
+}
+
+impl Drop for Texture {
+    fn drop(&mut self) {
+        unsafe { sys::pm_gpu_image_destroy(self.raw) };
+    }
+}
+
+/// What kind of OS handle `Encoder::import_texture` is given.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextureHandle {
+    /// The NT handle of a shared `ID3D11Texture2D` (Windows).
+    D3d11(usize),
 }
 
 unsafe impl Send for Encoder {}
@@ -186,8 +230,64 @@ impl Encoder {
             bitstream: Vec::new(),
             packets: Vec::new(),
             num_packets: 0,
-            _device: device,
+            texture: None,
+            last_from_texture: false,
+            device,
         })
+    }
+
+    /// Takes a texture owned by another graphics API as the source for `encode_texture`,
+    /// replacing any earlier one. It may be larger than the encoder; it is scaled down on the
+    /// GPU. The handle is consumed, whether this succeeds or not.
+    pub fn import_texture(&mut self, handle: TextureHandle, width: u32, height: u32, format: PixelFormat) -> Result<(), CodecError> {
+        self.texture = None;
+        let TextureHandle::D3d11(handle) = handle;
+        let format = match format {
+            PixelFormat::Bgrx => sys::PM_FORMAT_BGRA8,
+            PixelFormat::Rgbx => sys::PM_FORMAT_RGBA8,
+        };
+        let mut raw = std::ptr::null_mut();
+        check("image_create", unsafe {
+            sys::pm_gpu_image_import(self.device.raw, handle, sys::PM_HANDLE_D3D11_TEXTURE, width, height, format, &mut raw)
+        })?;
+        let exact_size = width as usize == self.planes.width && height as usize == self.planes.height;
+        self.texture = Some(Texture { raw, exact_size });
+        Ok(())
+    }
+
+    pub fn has_texture(&self) -> bool {
+        self.texture.is_some()
+    }
+
+    /// Forgets the imported texture.
+    pub fn drop_texture(&mut self) {
+        self.texture = None;
+        self.last_from_texture = false;
+    }
+
+    /// Encodes what the imported texture holds right now. Its owner must have finished writing
+    /// it, and must leave it alone until this returns. Scaling and colour conversion happen on
+    /// the GPU; no pixels pass through memory.
+    pub fn encode_texture(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
+        let Some(texture) = &self.texture else {
+            return Err(CodecError::Call { call: "encode_texture (no texture imported)", code: sys::PYROWAVE_ERROR_INVALID_ARGUMENT });
+        };
+        let max_frame_bytes = Self::frame_budget(max_frame_bytes);
+        check("encoder_encode_gpu_scaled_synchronous", unsafe {
+            sys::pm_gpu_image_encode(self.raw, texture.raw, texture.exact_size, max_frame_bytes)
+        })?;
+        self.last_from_texture = true;
+        self.packetize(max_frame_bytes, packet_boundary)
+    }
+
+    /// The packets of the frame encoded last.
+    pub fn last_packets(&self) -> Packets<'_> {
+        Packets { bitstream: &self.bitstream, packets: &self.packets[..self.num_packets] }
+    }
+
+    /// PyroWave rounds the target down to a multiple of 4 and needs some room to work with.
+    fn frame_budget(max_frame_bytes: usize) -> usize {
+        max_frame_bytes.max(16 * 1024) & !3
     }
 
     pub fn width(&self) -> u32 {
@@ -215,24 +315,32 @@ impl Encoder {
         let (w, h, chroma) = (self.planes.width, self.planes.height, self.planes.chroma);
         let [y, cb, cr] = &mut self.planes.data;
         color::packed_to_planar(pixels, stride, format, w, h, chroma, y, cb, cr);
+        self.last_from_texture = false;
         self.encode_planes(max_frame_bytes, packet_boundary)
     }
 
     /// Encodes the previously submitted frame again, e.g. to refresh a static desktop so that a
     /// client which lost packets converges to a clean image.
     pub fn encode_last(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
+        if self.last_from_texture && self.texture.is_some() {
+            // The texture still holds that frame.
+            return self.encode_texture(max_frame_bytes, packet_boundary);
+        }
         self.encode_planes(max_frame_bytes, packet_boundary)
     }
 
     fn encode_planes(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
-        // PyroWave rounds the target down to a multiple of 4 and needs some room to work with.
-        let max_frame_bytes = max_frame_bytes.max(16 * 1024) & !3;
+        let max_frame_bytes = Self::frame_budget(max_frame_bytes);
         let buffer = self.planes.cpu_buffer();
         let rate_control = sys::pyrowave_rate_control { maximum_bitstream_size: max_frame_bytes };
         check("encoder_encode_cpu_synchronous", unsafe {
             sys::pyrowave_encoder_encode_cpu_synchronous(self.raw, &buffer, &rate_control)
         })?;
+        self.packetize(max_frame_bytes, packet_boundary)
+    }
 
+    /// Collects the frame just encoded into packets; waits for the GPU to finish it.
+    fn packetize(&mut self, max_frame_bytes: usize, packet_boundary: usize) -> Result<Packets<'_>, CodecError> {
         let mut num_packets = 0usize;
         check("encoder_compute_num_packets", unsafe {
             sys::pyrowave_encoder_compute_num_packets(self.raw, packet_boundary, &mut num_packets)
@@ -268,6 +376,8 @@ impl Encoder {
 
 impl Drop for Encoder {
     fn drop(&mut self) {
+        // The texture goes first: it belongs to the same device.
+        self.texture = None;
         unsafe { sys::pyrowave_encoder_destroy(self.raw) };
     }
 }

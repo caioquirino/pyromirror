@@ -841,6 +841,13 @@ impl App {
                 });
                 ui.label(RichText::new("Jumbo packets need a network set up for them. Lower pacing is smoother on Wi-Fi; higher has less delay.").color(MUTED).small());
             });
+
+            ui.add_space(4.0);
+            card(ui, |ui| {
+                section(ui, "Capture");
+                ui.checkbox(&mut self.config.zero_copy, "Keep frames on the graphics card (faster)");
+                ui.label(RichText::new("Encodes straight from the captured picture instead of copying it through memory. Turn this off if the picture comes out wrong.").color(MUTED).small());
+            });
         });
     }
 

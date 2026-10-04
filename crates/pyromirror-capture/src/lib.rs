@@ -46,12 +46,20 @@ pub struct CaptureOptions {
 
 /// A captured desktop image, borrowed from the capturer until the next `next_frame` call.
 pub struct Frame<'a> {
+    /// The pixels; empty when the image stayed on the GPU (`texture`).
     pub data: &'a [u8],
     pub width: u32,
     pub height: u32,
     /// Bytes per row; may be larger than `width * 4`.
     pub stride: u32,
     pub format: PixelFormat,
+    /// Set when GPU frames are enabled and the image is in the capturer's shared texture
+    /// instead of `data`. The value identifies the texture: when it changes, the texture has
+    /// been replaced and must be exported again (`Capturer::export_texture`).
+    pub texture: Option<u64>,
+    /// How long it took to get the image here (reading it back from the GPU, or copying it
+    /// there), not counting the wait for the desktop to change. Zero where not measured.
+    pub prepare: Duration,
 }
 
 #[repr(C)]
@@ -104,6 +112,8 @@ struct RawFrame {
     height: u32,
     stride: u32,
     format: u32,
+    gpu_texture: u64,
+    prepare_us: u32,
 }
 
 const RAW_FORMAT_RGBX: u32 = 1;
@@ -117,6 +127,9 @@ extern "C" {
     #[cfg_attr(not(windows), allow(dead_code))]
     fn pyromirror_capture_get_bounds(ctx: *mut RawContext, x: *mut i32, y: *mut i32, width: *mut u32, height: *mut u32) -> bool;
     fn pyromirror_capture_get_cursor(ctx: *mut RawContext, out: *mut RawCursor);
+    fn pyromirror_capture_set_gpu(ctx: *mut RawContext, enable: bool) -> bool;
+    fn pyromirror_capture_export_texture(ctx: *mut RawContext) -> usize;
+    fn pyromirror_capture_get_adapter_luid(ctx: *mut RawContext, luid: *mut u8) -> bool;
     fn pyromirror_capture_hdr_active(ctx: *mut RawContext) -> bool;
     fn pyromirror_capture_last_error(ctx: *mut RawContext) -> *const c_char;
     fn pyromirror_capture_destroy(ctx: *mut RawContext);
@@ -243,18 +256,44 @@ impl Capturer {
         }
     }
 
+    /// The graphics adapter that captures (Windows: its LUID), which is where GPU frames live.
+    /// The encoder has to run on the same one to use them.
+    pub fn adapter_luid(&self) -> Option<[u8; 8]> {
+        let mut luid = [0u8; 8];
+        unsafe { pyromirror_capture_get_adapter_luid(self.ctx, luid.as_mut_ptr()) }.then_some(luid)
+    }
+
+    /// Asks for frames to stay on the GPU (`Frame::texture`) rather than be read back as pixels.
+    /// Returns false where capture cannot do that. Switching it off again makes the next
+    /// `next_frame` return the latest image as pixels, so nothing is lost by trying.
+    pub fn set_gpu_frames(&mut self, enable: bool) -> bool {
+        unsafe { pyromirror_capture_set_gpu(self.ctx, enable) }
+    }
+
+    /// A new OS handle to the texture GPU frames are in (Windows: an NT handle to a BGRA8
+    /// `ID3D11Texture2D`). The caller owns it.
+    pub fn export_texture(&mut self) -> Option<usize> {
+        match unsafe { pyromirror_capture_export_texture(self.ctx) } {
+            0 => None,
+            handle => Some(handle),
+        }
+    }
+
     /// Waits up to `timeout` for the desktop to change. `Ok(None)` means nothing was redrawn,
     /// which is the normal state of an idle desktop.
     pub fn next_frame(&mut self, timeout: Duration) -> Result<Option<Frame<'_>>, CaptureError> {
-        let mut raw = RawFrame { data: std::ptr::null(), width: 0, height: 0, stride: 0, format: 0 };
+        let mut raw = RawFrame { data: std::ptr::null(), width: 0, height: 0, stride: 0, format: 0, gpu_texture: 0, prepare_us: 0 };
         let timeout_ms = timeout.as_millis().min(u32::MAX as u128) as u32;
         match unsafe { pyromirror_capture_acquire(self.ctx, timeout_ms, &mut raw) } {
             RAW_FRAME => {
+                let on_gpu = raw.gpu_texture != 0 || raw.data.is_null();
                 let len = raw.stride as usize * (raw.height as usize).saturating_sub(1) + raw.width as usize * 4;
                 Ok(Some(Frame {
                     // SAFETY: the native side guarantees `data` covers every row at `stride`
                     // spacing until the next acquire/release, which needs `&mut self`.
-                    data: unsafe { std::slice::from_raw_parts(raw.data, len) },
+                    data: if on_gpu { &[] } else { unsafe { std::slice::from_raw_parts(raw.data, len) } },
+                    texture: (raw.gpu_texture != 0).then_some(raw.gpu_texture),
+                    prepare: Duration::from_micros(raw.prepare_us as u64),
                     width: raw.width,
                     height: raw.height,
                     stride: raw.stride,

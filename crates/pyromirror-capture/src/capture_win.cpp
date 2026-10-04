@@ -3,14 +3,17 @@
 // DXGI Desktop Duplication capture.
 //
 // Each changed desktop image is copied into a CPU-readable staging texture and handed out as a
-// mapped BGRA pointer.
+// mapped BGRA pointer. In GPU mode it is instead copied into a shared texture that the encoder
+// reads directly through Vulkan, which skips the readback (the expensive part at 4K).
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dxgi1_6.h>
 #include <d3d11.h>
+#include <d3d11_4.h>
 #include <wrl/client.h>
 #include <stdio.h>
+#include <string.h>
 #include <string>
 #include <vector>
 #include "../include/pyromirror_capture.h"
@@ -26,6 +29,21 @@ struct pyromirror_capture_context {
     D3D11_TEXTURE2D_DESC staging_desc = {};
     bool mapped = false;
     std::string last_error;
+    LUID adapter_luid = {};
+
+    // GPU mode.
+    bool gpu = false;
+    ComPtr<ID3D11Texture2D> shared;
+    D3D11_TEXTURE2D_DESC shared_desc = {};
+    uint64_t shared_id = 0;
+    // The shared texture holds an image nobody has received as pixels (set when GPU mode is
+    // switched off).
+    bool shared_pending = false;
+    // Either of these tells when the GPU has finished copying into the shared texture.
+    ComPtr<ID3D11DeviceContext4> context4;
+    ComPtr<ID3D11Fence> fence;
+    uint64_t fence_value = 0;
+    ComPtr<ID3D11Query> copy_done;
 
     // Desktop Duplication never draws the pointer into the image; it reports it on the side.
     uint64_t cursor_serial = 0;
@@ -176,6 +194,110 @@ static bool find_output(int32_t wanted, ComPtr<IDXGIAdapter1>& out_adapter, ComP
     return false;
 }
 
+// Copies `src` into the staging texture, from where it can be read (see map_staging).
+static bool copy_to_staging(pyromirror_capture_context* ctx, ID3D11Texture2D* src) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    src->GetDesc(&desc);
+    if (!ctx->staging || ctx->staging_desc.Width != desc.Width || ctx->staging_desc.Height != desc.Height ||
+        ctx->staging_desc.Format != desc.Format) {
+        D3D11_TEXTURE2D_DESC staging_desc = {};
+        staging_desc.Width = desc.Width;
+        staging_desc.Height = desc.Height;
+        staging_desc.MipLevels = 1;
+        staging_desc.ArraySize = 1;
+        staging_desc.Format = desc.Format;
+        staging_desc.SampleDesc.Count = 1;
+        staging_desc.Usage = D3D11_USAGE_STAGING;
+        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+
+        ctx->staging.Reset();
+        HRESULT hr = ctx->device->CreateTexture2D(&staging_desc, nullptr, &ctx->staging);
+        if (FAILED(hr)) {
+            ctx->last_error = hr_message("CreateTexture2D(staging)", hr);
+            return false;
+        }
+        ctx->staging_desc = staging_desc;
+    }
+
+    ctx->context->CopyResource(ctx->staging.Get(), src);
+    return true;
+}
+
+// Hands out the staging texture's pixels.
+static int map_staging(pyromirror_capture_context* ctx, pyromirror_capture_frame* out_frame) {
+    D3D11_MAPPED_SUBRESOURCE mapped = {};
+    HRESULT hr = ctx->context->Map(ctx->staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
+    if (FAILED(hr)) {
+        ctx->last_error = hr_message("ID3D11DeviceContext::Map", hr);
+        return PYROMIRROR_CAPTURE_ERROR;
+    }
+    ctx->mapped = true;
+
+    // Desktop duplication always delivers DXGI_FORMAT_B8G8R8A8_UNORM.
+    out_frame->data = static_cast<const uint8_t*>(mapped.pData);
+    out_frame->width = ctx->staging_desc.Width;
+    out_frame->height = ctx->staging_desc.Height;
+    out_frame->stride = mapped.RowPitch;
+    out_frame->format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
+    out_frame->gpu_texture = 0;
+    out_frame->prepare_us = 0;
+    return PYROMIRROR_CAPTURE_FRAME;
+}
+
+// Makes sure there is a shared texture matching `desc`. A new one gets a new id.
+static bool ensure_shared(pyromirror_capture_context* ctx, const D3D11_TEXTURE2D_DESC& desc) {
+    if (ctx->shared && ctx->shared_desc.Width == desc.Width && ctx->shared_desc.Height == desc.Height &&
+        ctx->shared_desc.Format == desc.Format) {
+        return true;
+    }
+    D3D11_TEXTURE2D_DESC shared_desc = {};
+    shared_desc.Width = desc.Width;
+    shared_desc.Height = desc.Height;
+    shared_desc.MipLevels = 1;
+    shared_desc.ArraySize = 1;
+    shared_desc.Format = desc.Format;
+    shared_desc.SampleDesc.Count = 1;
+    shared_desc.Usage = D3D11_USAGE_DEFAULT;
+    shared_desc.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
+    // An NT handle is what Vulkan imports (VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT).
+    shared_desc.MiscFlags = D3D11_RESOURCE_MISC_SHARED | D3D11_RESOURCE_MISC_SHARED_NTHANDLE;
+
+    ctx->shared.Reset();
+    if (FAILED(ctx->device->CreateTexture2D(&shared_desc, nullptr, &ctx->shared))) {
+        return false;
+    }
+    ctx->shared_desc = shared_desc;
+    ctx->shared_id++;
+    return true;
+}
+
+// Blocks until the GPU has executed everything issued so far, so that another API can read the
+// shared texture without any further synchronisation.
+static void wait_for_gpu(pyromirror_capture_context* ctx) {
+    if (ctx->fence && ctx->context4) {
+        if (SUCCEEDED(ctx->context4->Signal(ctx->fence.Get(), ++ctx->fence_value))) {
+            ctx->context->Flush();
+            // A null event makes this call wait.
+            if (SUCCEEDED(ctx->fence->SetEventOnCompletion(ctx->fence_value, nullptr))) {
+                return;
+            }
+        }
+    }
+    if (ctx->copy_done) {
+        ctx->context->End(ctx->copy_done.Get());
+        ctx->context->Flush();
+        BOOL done = FALSE;
+        // A copy takes well under a millisecond; give up after a while rather than hang.
+        for (int i = 0; i < 2000; ++i) {
+            if (ctx->context->GetData(ctx->copy_done.Get(), &done, sizeof(done), 0) == S_OK && done) {
+                return;
+            }
+            Sleep(0);
+        }
+    }
+    ctx->context->Flush();
+}
+
 static HRESULT duplicate(pyromirror_capture_context* ctx) {
     ctx->duplication.Reset();
     return ctx->output->DuplicateOutput(ctx->device.Get(), &ctx->duplication);
@@ -216,6 +338,20 @@ extern "C" pyromirror_capture_context* pyromirror_capture_create(const pyromirro
         }
     }
 
+    if (ok) {
+        DXGI_ADAPTER_DESC1 adapter_desc = {};
+        if (SUCCEEDED(adapter->GetDesc1(&adapter_desc))) {
+            ctx->adapter_luid = adapter_desc.AdapterLuid;
+        }
+        // For GPU mode; either is enough, and without both it still works, just less safely.
+        ComPtr<ID3D11Device5> device5;
+        if (SUCCEEDED(ctx->device.As(&device5)) && SUCCEEDED(ctx->context.As(&ctx->context4))) {
+            device5->CreateFence(0, D3D11_FENCE_FLAG_NONE, IID_PPV_ARGS(&ctx->fence));
+        }
+        D3D11_QUERY_DESC query_desc = { D3D11_QUERY_EVENT, 0 };
+        ctx->device->CreateQuery(&query_desc, &ctx->copy_done);
+    }
+
     if (!ok) {
         if (error && error_size) {
             snprintf(error, error_size, "%s", err.c_str());
@@ -236,6 +372,11 @@ extern "C" void pyromirror_capture_release(pyromirror_capture_context* ctx) {
 extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint32_t timeout_ms, pyromirror_capture_frame* out_frame) {
     if (!ctx || !out_frame) return PYROMIRROR_CAPTURE_ERROR;
     pyromirror_capture_release(ctx);
+
+    if (!ctx->gpu && ctx->shared_pending && ctx->shared) {
+        ctx->shared_pending = false;
+        return copy_to_staging(ctx, ctx->shared.Get()) ? map_staging(ctx, out_frame) : PYROMIRROR_CAPTURE_ERROR;
+    }
 
     if (!ctx->duplication) {
         // Lost earlier (mode change, UAC, lock screen, fullscreen switch); keep retrying.
@@ -267,6 +408,14 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
     }
 
     update_cursor(ctx, info);
+    LARGE_INTEGER prepare_start;
+    QueryPerformanceCounter(&prepare_start);
+    auto prepare_us = [&]() -> uint32_t {
+        LARGE_INTEGER now, frequency;
+        QueryPerformanceCounter(&now);
+        QueryPerformanceFrequency(&frequency);
+        return static_cast<uint32_t>((now.QuadPart - prepare_start.QuadPart) * 1000000 / frequency.QuadPart);
+    };
 
     // LastPresentTime == 0 means only the mouse pointer moved; the desktop image is unchanged.
     ComPtr<ID3D11Texture2D> tex;
@@ -275,51 +424,66 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
         return PYROMIRROR_CAPTURE_NO_FRAME;
     }
 
-    D3D11_TEXTURE2D_DESC desc = {};
-    tex->GetDesc(&desc);
-    if (!ctx->staging || ctx->staging_desc.Width != desc.Width || ctx->staging_desc.Height != desc.Height ||
-        ctx->staging_desc.Format != desc.Format) {
-        D3D11_TEXTURE2D_DESC staging_desc = {};
-        staging_desc.Width = desc.Width;
-        staging_desc.Height = desc.Height;
-        staging_desc.MipLevels = 1;
-        staging_desc.ArraySize = 1;
-        staging_desc.Format = desc.Format;
-        staging_desc.SampleDesc.Count = 1;
-        staging_desc.Usage = D3D11_USAGE_STAGING;
-        staging_desc.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
-
-        ctx->staging.Reset();
-        hr = ctx->device->CreateTexture2D(&staging_desc, nullptr, &ctx->staging);
-        if (FAILED(hr)) {
+    if (ctx->gpu) {
+        D3D11_TEXTURE2D_DESC desc = {};
+        tex->GetDesc(&desc);
+        if (ensure_shared(ctx, desc)) {
+            // Copy and hand the frame back to DWM straight away; holding it stalls desktop
+            // composition.
+            ctx->context->CopyResource(ctx->shared.Get(), tex.Get());
+            tex.Reset();
+            resource.Reset();
             ctx->duplication->ReleaseFrame();
-            ctx->last_error = hr_message("CreateTexture2D(staging)", hr);
-            return PYROMIRROR_CAPTURE_ERROR;
+            wait_for_gpu(ctx);
+
+            out_frame->data = nullptr;
+            out_frame->width = desc.Width;
+            out_frame->height = desc.Height;
+            out_frame->stride = 0;
+            out_frame->format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
+            out_frame->gpu_texture = ctx->shared_id;
+            out_frame->prepare_us = prepare_us();
+            return PYROMIRROR_CAPTURE_FRAME;
         }
-        ctx->staging_desc = staging_desc;
+        // No shared texture on this device; carry on with pixels.
+        ctx->gpu = false;
     }
 
     // Copy and hand the frame back to DWM straight away; holding it stalls desktop composition.
-    ctx->context->CopyResource(ctx->staging.Get(), tex.Get());
+    bool copied = copy_to_staging(ctx, tex.Get());
     tex.Reset();
     resource.Reset();
     ctx->duplication->ReleaseFrame();
+    if (!copied) return PYROMIRROR_CAPTURE_ERROR;
+    int result = map_staging(ctx, out_frame);
+    out_frame->prepare_us = prepare_us();
+    return result;
+}
 
-    D3D11_MAPPED_SUBRESOURCE mapped = {};
-    hr = ctx->context->Map(ctx->staging.Get(), 0, D3D11_MAP_READ, 0, &mapped);
-    if (FAILED(hr)) {
-        ctx->last_error = hr_message("ID3D11DeviceContext::Map", hr);
-        return PYROMIRROR_CAPTURE_ERROR;
+extern "C" bool pyromirror_capture_set_gpu(pyromirror_capture_context* ctx, bool enable) {
+    if (!ctx) return false;
+    if (ctx->gpu && !enable && ctx->shared) {
+        ctx->shared_pending = true;
     }
-    ctx->mapped = true;
+    ctx->gpu = enable;
+    return true;
+}
 
-    // Desktop duplication always delivers DXGI_FORMAT_B8G8R8A8_UNORM.
-    out_frame->data = static_cast<const uint8_t*>(mapped.pData);
-    out_frame->width = desc.Width;
-    out_frame->height = desc.Height;
-    out_frame->stride = mapped.RowPitch;
-    out_frame->format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
-    return PYROMIRROR_CAPTURE_FRAME;
+extern "C" uintptr_t pyromirror_capture_export_texture(pyromirror_capture_context* ctx) {
+    ComPtr<IDXGIResource1> resource;
+    HANDLE handle = nullptr;
+    if (!ctx || !ctx->shared || FAILED(ctx->shared.As(&resource)) ||
+        FAILED(resource->CreateSharedHandle(nullptr, GENERIC_ALL, nullptr, &handle))) {
+        return 0;
+    }
+    return reinterpret_cast<uintptr_t>(handle);
+}
+
+extern "C" bool pyromirror_capture_get_adapter_luid(pyromirror_capture_context* ctx, uint8_t* luid) {
+    if (!ctx || !luid) return false;
+    static_assert(sizeof(LUID) == 8, "LUID is expected to be 8 bytes");
+    memcpy(luid, &ctx->adapter_luid, sizeof(LUID));
+    return true;
 }
 
 extern "C" void pyromirror_capture_get_cursor(pyromirror_capture_context* ctx, pyromirror_capture_cursor* out) {

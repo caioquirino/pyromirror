@@ -89,6 +89,16 @@ fn main() {
     };
     println!("cargo:rustc-link-lib=dylib={}", link_name);
 
+    // Helpers for the entry points that take Vulkan types (see glue.c). Plain C, so nothing but
+    // the PyroWave library itself is pulled in.
+    println!("cargo:rerun-if-changed=src/glue.c");
+    cc::Build::new()
+        .file("src/glue.c")
+        .include(&pyrowave_src)
+        .include(pyrowave_src.join("Granite/third_party/khronos/vulkan-headers/include"))
+        .warnings(false)
+        .compile("pyromirror_pyrowave_glue");
+
     // Place the runtime library next to the final executables (target/<profile>/ and deps/ for
     // tests) so they run without PATH / LD_LIBRARY_PATH tweaks. OUT_DIR is
     // target/[<triple>/]<profile>/build/pyrowave-sys-<hash>/out.

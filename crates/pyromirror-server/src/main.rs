@@ -18,7 +18,7 @@ use log::{debug, error, info, trace, warn};
 
 use pyromirror_audio::AudioCapture;
 use pyromirror_capture::{CaptureOptions, Capturer, InputInjector};
-use pyromirror_codec::{Chroma, Device, Encoder, Packets};
+use pyromirror_codec::{Chroma, Device, Encoder, Packets, TextureHandle};
 use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::control::{Listener, Side, Toggles};
@@ -95,6 +95,11 @@ struct Args {
     #[arg(long)]
     no_audio: bool,
 
+    /// Read every frame back from the GPU and convert it on the CPU, as older versions did,
+    /// instead of encoding straight from the captured texture
+    #[arg(long)]
+    no_zero_copy: bool,
+
     /// Ignore the client's mouse and keyboard (view-only)
     #[arg(long)]
     no_input: bool,
@@ -128,6 +133,8 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
 struct Pipeline {
     source: Source,
     encoder: Encoder,
+    /// The capture texture the encoder has imported, while frames stay on the GPU.
+    imported_texture: Option<u64>,
     max_frame_bytes: usize,
     packet_boundary: usize,
     frame_interval: Duration,
@@ -191,6 +198,55 @@ fn encode_frame<'e>(
     Ok(encoder.encode(frame.data, frame.stride as usize, frame.format, max_frame_bytes, packet_boundary)?)
 }
 
+/// A frame that stayed on the GPU, as far as encoding needs to know it.
+#[derive(Clone, Copy)]
+struct TextureFrame {
+    id: u64,
+    width: u32,
+    height: u32,
+    format: pyromirror_codec::PixelFormat,
+}
+
+/// Encodes straight from the capture texture. `None` means that did not work: zero-copy has
+/// been switched off, and the same image comes again as pixels with the next frame.
+fn encode_texture<'e>(
+    source: &mut Source,
+    encoder: &'e mut Encoder,
+    imported: &mut Option<u64>,
+    frame: TextureFrame,
+    max_frame_bytes: usize,
+    packet_boundary: usize,
+) -> anyhow::Result<Option<Packets<'e>>> {
+    // The texture is the whole desktop; the encoder shrinks it by the --scale factor.
+    let scale = source.scale().max(1);
+    let (width, height) = (frame.width / scale, frame.height / scale);
+    if width & !1 != encoder.width() & !1 || height & !1 != encoder.height() & !1 {
+        bail!("desktop resolution changed to {}x{}; restart the server to stream it", frame.width, frame.height);
+    }
+
+    let mut attempt = || -> anyhow::Result<()> {
+        if *imported != Some(frame.id) {
+            *imported = None;
+            let handle = source.export_texture().context("the capture texture could not be shared")?;
+            encoder.import_texture(TextureHandle::D3d11(handle), frame.width, frame.height, frame.format)?;
+            *imported = Some(frame.id);
+            info!("Zero-copy capture: encoding straight from the {}x{} desktop texture", frame.width, frame.height);
+        }
+        encoder.encode_texture(max_frame_bytes, packet_boundary)?;
+        Ok(())
+    };
+    match attempt() {
+        Ok(()) => Ok(Some(encoder.last_packets())),
+        Err(e) => {
+            warn!("Zero-copy capture failed ({:#}); reading frames back from the GPU instead", e);
+            *imported = None;
+            encoder.drop_texture();
+            source.set_gpu_frames(false);
+            Ok(None)
+        }
+    }
+}
+
 fn main() -> anyhow::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
@@ -206,6 +262,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     let mut injector = None;
+    let mut capture_adapter = None;
     let mut source = match args.test_pattern {
         Some((w, h)) => {
             info!("Streaming a {}x{} test pattern instead of the desktop", w, h);
@@ -214,6 +271,7 @@ fn main() -> anyhow::Result<()> {
         None => {
             let capturer =
                 Capturer::new(&CaptureOptions { output: args.monitor }).context("could not start desktop capture")?;
+            capture_adapter = capturer.adapter_luid();
             if !args.no_input {
                 injector = capturer.input_injector();
                 if injector.is_none() {
@@ -225,7 +283,21 @@ fn main() -> anyhow::Result<()> {
     }
     .with_scale(args.scale);
 
-    let device = Device::new().context("could not initialise PyroWave")?;
+    // Frames can stay on the GPU only if the encoder runs on the adapter that captures them.
+    let (device, mut zero_copy) = match capture_adapter.filter(|_| !args.no_zero_copy).map(Device::on_adapter) {
+        Some(Ok(device)) => {
+            let usable = device.supports_texture_import();
+            if !usable {
+                info!("The graphics driver cannot share textures; frames will be read back from the GPU");
+            }
+            (device, usable)
+        }
+        Some(Err(e)) => {
+            debug!("No PyroWave device on the capture adapter ({}); using the default one", e);
+            (Device::new().context("could not initialise PyroWave")?, false)
+        }
+        None => (Device::new().context("could not initialise PyroWave")?, false),
+    };
 
     let max_frame_bytes = (args.bitrate_mbps as usize * 1_000_000 / 8) / args.fps as usize;
     let boundary = packet_boundary(args.mtu as usize);
@@ -249,6 +321,13 @@ fn main() -> anyhow::Result<()> {
         Ok(encoder)
     })?;
     let (width, height) = (encoder.width(), encoder.height());
+
+    // From here on frames stay on the GPU where that is possible. The first one above came as
+    // pixels either way, which is what a fallback has to start from.
+    zero_copy = zero_copy && source.set_gpu_frames(true);
+    if !zero_copy && !args.no_zero_copy {
+        debug!("Zero-copy capture is not available here; frames are read back and converted on the CPU");
+    }
 
     info!(
         "Streaming {}x{} at up to {} fps, {} Mbps ({} KiB per frame), {} byte datagrams, chroma {:?}",
@@ -319,6 +398,7 @@ fn main() -> anyhow::Result<()> {
     let mut pipeline = Pipeline {
         source,
         encoder,
+        imported_texture: None,
         max_frame_bytes,
         packet_boundary: boundary,
         frame_interval: Duration::from_secs_f64(1.0 / args.fps as f64),
@@ -498,6 +578,7 @@ fn serve_client(
         let result = stream_video(
             &mut pipeline.source,
             &mut pipeline.encoder,
+            &mut pipeline.imported_texture,
             pipeline.max_frame_bytes,
             pipeline.packet_boundary,
             pipeline.frame_interval,
@@ -559,6 +640,7 @@ fn inject(injector: &InputInjector, event: InputEvent, stream_w: f64, stream_h: 
 fn stream_video(
     source: &mut Source,
     encoder: &mut Encoder,
+    imported_texture: &mut Option<u64>,
     max_frame_bytes: usize,
     packet_boundary: usize,
     frame_interval: Duration,
@@ -591,8 +673,19 @@ fn stream_video(
         let encode_start = Instant::now();
         // Borrow of `source` by the frame ends with the encode below; the pointer is checked
         // after it.
+        let (mut prepare, mut on_gpu) = (Duration::ZERO, false);
         let packets = match frame {
-            Some(frame) => Some(encode_frame(encoder, &frame, max_frame_bytes, packet_boundary)?),
+            Some(frame) => {
+                prepare = frame.prepare;
+                match frame.texture {
+                    Some(id) => {
+                        on_gpu = true;
+                        let texture = TextureFrame { id, width: frame.width, height: frame.height, format: frame.format };
+                        encode_texture(source, encoder, imported_texture, texture, max_frame_bytes, packet_boundary)?
+                    }
+                    None => Some(encode_frame(encoder, &frame, max_frame_bytes, packet_boundary)?),
+                }
+            }
             None if last_sent.map_or(true, |t| t.elapsed() >= IDLE_REFRESH) => {
                 Some(encoder.encode_last(max_frame_bytes, packet_boundary)?)
             }
@@ -603,7 +696,7 @@ fn stream_video(
             let encode_time = encode_start.elapsed();
             let pts = start.elapsed().as_micros() as u64;
             match sender.send_frame(packets.iter(), pts) {
-                Ok(bytes) => stats.frame(bytes, encode_time),
+                Ok(bytes) => stats.frame(bytes, prepare, encode_time, on_gpu),
                 // A full send buffer or a transient ICMP error only costs this frame.
                 Err(e) => warn!("Dropped a frame: {}", e),
             }
@@ -643,14 +736,22 @@ struct Stats {
     since: Option<Instant>,
     frames: u32,
     bytes: usize,
+    /// Getting frames to the encoder: readback and shrinking, or the copy on the GPU.
+    prepare: Duration,
+    /// Colour conversion (when done on the CPU) and encoding.
     encode: Duration,
+    /// Frames that never left the GPU.
+    on_gpu: u32,
+    reported: bool,
 }
 
 impl Stats {
-    fn frame(&mut self, bytes: usize, encode: Duration) {
+    fn frame(&mut self, bytes: usize, prepare: Duration, encode: Duration, on_gpu: bool) {
         self.frames += 1;
         self.bytes += bytes;
+        self.prepare += prepare;
         self.encode += encode;
+        self.on_gpu += on_gpu as u32;
     }
 
     fn report(&mut self) {
@@ -660,13 +761,28 @@ impl Stats {
             return;
         }
         if self.frames > 0 {
-            debug!(
-                "{:.1} fps, {:.1} Mbps, {:.2} ms convert+encode per frame",
+            let per_frame = |total: Duration| total.as_secs_f64() * 1000.0 / self.frames as f64;
+            let path = match self.on_gpu {
+                0 => "read back, converted on the CPU",
+                n if n == self.frames => "zero-copy",
+                _ => "mixed",
+            };
+            let line = format!(
+                "{:.1} fps, {:.1} Mbps; per frame: {:.2} ms capture + {:.2} ms encode ({})",
                 self.frames as f64 / elapsed.as_secs_f64(),
                 self.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
-                self.encode.as_secs_f64() * 1000.0 / self.frames as f64
+                per_frame(self.prepare),
+                per_frame(self.encode),
+                path
             );
+            // Once per session where everyone sees it, then only for those who ask.
+            if self.reported {
+                debug!("{}", line);
+            } else {
+                info!("Frame cost: {}", line);
+            }
+            self.reported = true;
         }
-        *self = Stats { since: Some(Instant::now()), ..Default::default() };
+        *self = Stats { since: Some(Instant::now()), reported: self.reported, ..Default::default() };
     }
 }
