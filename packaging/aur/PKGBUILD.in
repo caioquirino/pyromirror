@@ -13,7 +13,7 @@ conflicts=('pyromirror')
 _version=@VERSION@
 source=("$url/releases/download/v$_version/pyromirror-$_version-linux-x86_64.tar.gz"
         "pyromirror-$_version.desktop::https://raw.githubusercontent.com/caioquirino/pyromirror/v$_version/packaging/linux/pyromirror.desktop"
-        "pyromirror-$_version.svg::https://raw.githubusercontent.com/caioquirino/pyromirror/v$_version/packaging/linux/pyromirror.svg")
+        "pyromirror-$_version.png::https://raw.githubusercontent.com/caioquirino/pyromirror/v$_version/packaging/linux/pyromirror.png")
 sha256sums=('@SHA256@'
             'SKIP'
             'SKIP')
@@ -29,5 +29,5 @@ package() {
     done
     install -Dm644 LICENSE NOTICE -t "$pkgdir/usr/share/licenses/$pkgname"
     install -Dm644 "$srcdir/pyromirror-$_version.desktop" "$pkgdir/usr/share/applications/pyromirror.desktop"
-    install -Dm644 "$srcdir/pyromirror-$_version.svg" "$pkgdir/usr/share/icons/hicolor/scalable/apps/pyromirror.svg"
+    install -Dm644 "$srcdir/pyromirror-$_version.png" "$pkgdir/usr/share/icons/hicolor/256x256/apps/pyromirror.png"
 }

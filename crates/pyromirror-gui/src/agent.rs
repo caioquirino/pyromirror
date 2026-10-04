@@ -58,6 +58,7 @@ pub fn run() {
         }
     };
 
+    let mut announcer = crate::notify::Announcer::default();
     let mut started_here = server.is_running();
     let mut was_attention = false;
     loop {
@@ -77,6 +78,7 @@ pub fn run() {
         }
         was_attention = attention;
 
+        announcer.observe(&state);
         let (indicator, tooltip) = summarize(&state);
         if let Some(tray) = &mut tray {
             tray.update(indicator, &tooltip, running);

@@ -141,7 +141,7 @@ cargo build --release
 The first build clones the Granite revision PyroWave is pinned to (into `submodules/pyrowave/Granite`, so it needs `git` and network access) and compiles PyroWave with CMake. `libpyrowave-shared` is copied next to the binaries; keep it there when moving them elsewhere.
 
 Binaries will be placed in `target/release/`:
-* `pyromirror`: The launcher window. **Connect** and **Share** each show one state and one button; everything adjustable lives under **Settings**, grouped by what it applies to: **When sharing** (picture, sound and control, pairing requirement, network), **When connecting** (the viewer window) and **General** (startup). The lists of computers live on the Connect and Share tabs. It starts the two programs below for you and remembers your settings.
+* `pyromirror`: The launcher window. **Connect** and **Share** each show one state and one button; everything adjustable lives under **Settings**, grouped by what it applies to: **Host Options** (picture, sound and control, pairing requirement, network), **Client Options** (the viewer window) and **General** (startup). The lists of computers live on the Connect and Share tabs. It starts the two programs below for you and remembers your settings.
 * `pyromirror-server`: The streaming host (screen capture, encoder).
 * `pyromirror-client`: The viewer (SDL3 window, decoder, input capture).
 
@@ -207,7 +207,7 @@ The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) 
 
 In **Settings → General**:
 
-* **Start PyroMirror in the tray when I log in** adds a login entry (the `Run` registry key on Windows, an XDG autostart file on Linux) and puts an icon in the tray. The icon's dot shows whether sharing is off, on, or in use, and its menu can start or stop sharing, open the window, or quit. With the icon running, closing the window no longer stops sharing.
+* **Start PyroMirror in the tray when I log in** adds a login entry (the `Run` registry key on Windows, an XDG autostart file on Linux) and puts an icon in the tray. It is the PyroMirror icon with the state worked in: a grey flame while sharing is off, a burning one while it is on, a green badge while someone is connected, a yellow badge when something needs you. Its menu can start or stop sharing, open the window, or quit. A notification appears when someone connects, disconnects or asks to pair. With the icon running, closing the window no longer stops sharing.
 * **Start sharing automatically at login** makes the computer reachable without anyone at the desk. Switching it on first runs a permission check (`pyromirror-server --check-permissions`): it starts screen capture so your desktop asks for consent now, verifies the consent is remembered, and on Windows waits for the firewall to allow incoming connections. The setting only turns on if the check passes.
 
 GNOME shows tray icons only with the AppIndicator extension; without it everything else still works and the window is opened from the application menu. Nothing runs before you log in, and on Windows the picture pauses on the lock screen and on UAC prompts.

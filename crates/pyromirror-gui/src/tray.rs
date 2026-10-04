@@ -27,44 +27,94 @@ pub enum Indicator {
     Attention,
 }
 
-/// Draws the icon: a dark rounded tile with an orange disc, and a status dot in the corner.
-/// Returns `size * size` RGBA pixels.
+/// Draws the PyroMirror icon (the same screen-and-flame as the window, shortcut and package
+/// icons) with the sharing state worked in:
+///
+/// - off: the flame is grey
+/// - sharing: the flame burns
+/// - someone connected: burning, with a green badge
+/// - needs attention: burning, with a yellow badge
+///
+/// Returns `size * size` RGBA pixels. The shapes are those of `assets/icon.png` (a test checks it),
+/// drawn in a 256x256 coordinate space.
 pub fn icon_rgba(size: u32, indicator: Indicator) -> Vec<u8> {
-    let s = size as f32;
-    let dot = match indicator {
-        Indicator::Off => [0x8b, 0x93, 0xa3],
-        Indicator::On => [0x3e, 0xcf, 0x8e],
-        Indicator::Connected => [0xff, 0xff, 0xff],
-        Indicator::Attention => [0xf2, 0xc1, 0x4e],
+    const BG: [u8; 3] = [0x12, 0x15, 0x1c];
+    const SCREEN: [u8; 3] = [0x1b, 0x20, 0x2b];
+    const BORDER: [u8; 3] = [0x2e, 0x35, 0x45];
+    let (flame_outer, flame_inner) = match indicator {
+        Indicator::Off => ([0x6b, 0x73, 0x82], [0x9a, 0xa1, 0xae]),
+        _ => ([0xff, 0x7a, 0x2f], [0xff, 0xd2, 0x7a]),
     };
-    // Signed distance to a shape -> coverage, for one pixel of anti-aliasing.
-    let cover = |distance: f32| (0.5 - distance).clamp(0.0, 1.0);
+    let badge = match indicator {
+        Indicator::Connected => Some([0x3e, 0xcf, 0x8e]),
+        Indicator::Attention => Some([0xf2, 0xc1, 0x4e]),
+        Indicator::Off | Indicator::On => None,
+    };
+
+    let rounded_rect = |x: f32, y: f32, x0: f32, y0: f32, w: f32, h: f32, r: f32| {
+        let cx = x.clamp(x0 + r, x0 + w - r);
+        let cy = y.clamp(y0 + r, y0 + h - r);
+        (x - cx).powi(2) + (y - cy).powi(2) <= r * r
+    };
+    // A disc with a pointed top.
+    let flame = |x: f32, y: f32, cy: f32, r: f32, tip: f32| {
+        let dx = x - 128.0;
+        dx * dx + (y - cy).powi(2) <= r * r || (y >= tip && y <= cy && dx.abs() <= r * ((y - tip) / (cy - tip)).powf(0.8))
+    };
+    let disc = |x: f32, y: f32, cx: f32, cy: f32, r: f32| (x - cx).powi(2) + (y - cy).powi(2) <= r * r;
+
+    // Supersampled: every pixel averages SS x SS samples.
+    const SS: u32 = 4;
+    let scale = 256.0 / (size * SS) as f32;
     let mut out = vec![0u8; (size * size * 4) as usize];
-    for y in 0..size {
-        for x in 0..size {
-            let (px, py) = (x as f32 + 0.5, y as f32 + 0.5);
-            // Rounded tile.
-            let r = s * 0.22;
-            let (dx, dy) = ((px - s / 2.0).abs() - (s / 2.0 - r), (py - s / 2.0).abs() - (s / 2.0 - r));
-            let tile = cover(dx.max(0.0).hypot(dy.max(0.0)) + dx.max(dy).min(0.0) - r);
-            let disc = cover((px - s * 0.45).hypot(py - s * 0.45) - s * 0.27);
-            let status = cover((px - s * 0.74).hypot(py - s * 0.74) - s * 0.19);
-            // A dark ring keeps the dot readable on the disc.
-            let ring = cover((px - s * 0.74).hypot(py - s * 0.74) - s * 0.26);
-
-            let mut rgb = [0x12 as f32, 0x15 as f32, 0x1c as f32];
-            let mut blend = |color: [u8; 3], a: f32| {
-                for i in 0..3 {
-                    rgb[i] += (color[i] as f32 - rgb[i]) * a;
+    for py in 0..size {
+        for px in 0..size {
+            let (mut sum, mut covered) = ([0u32; 3], 0u32);
+            for sy in 0..SS {
+                for sx in 0..SS {
+                    let x = ((px * SS + sx) as f32 + 0.5) * scale;
+                    let y = ((py * SS + sy) as f32 + 0.5) * scale;
+                    if !rounded_rect(x, y, 0.0, 0.0, 256.0, 256.0, 56.0) {
+                        continue;
+                    }
+                    let mut color = BG;
+                    if rounded_rect(x, y, 104.0, 184.0, 48.0, 12.0, 4.0) || rounded_rect(x, y, 84.0, 196.0, 88.0, 12.0, 6.0) {
+                        color = BORDER;
+                    }
+                    if rounded_rect(x, y, 37.0, 53.0, 182.0, 122.0, 17.0) {
+                        color = BORDER;
+                    }
+                    if rounded_rect(x, y, 43.0, 59.0, 170.0, 110.0, 11.0) {
+                        color = SCREEN;
+                    }
+                    if flame(x, y, 130.0, 30.0, 72.0) {
+                        color = flame_outer;
+                    }
+                    if flame(x, y, 141.0, 12.0, 116.0) {
+                        color = flame_inner;
+                    }
+                    if let Some(badge) = badge {
+                        // Big enough to read at 16 pixels, with a dark ring to set it off.
+                        if disc(x, y, 196.0, 196.0, 58.0) {
+                            color = BG;
+                        }
+                        if disc(x, y, 196.0, 196.0, 44.0) {
+                            color = badge;
+                        }
+                    }
+                    for i in 0..3 {
+                        sum[i] += color[i] as u32;
+                    }
+                    covered += 1;
                 }
-            };
-            blend([0xff, 0x7a, 0x2f], disc);
-            blend([0x12, 0x15, 0x1c], ring);
-            blend(dot, status);
-
-            let i = ((y * size + x) * 4) as usize;
-            out[i..i + 3].copy_from_slice(&[rgb[0] as u8, rgb[1] as u8, rgb[2] as u8]);
-            out[i + 3] = (tile * 255.0) as u8;
+            }
+            if covered > 0 {
+                let i = ((py * size + px) * 4) as usize;
+                for c in 0..3 {
+                    out[i + c] = (sum[c] / covered) as u8;
+                }
+                out[i + 3] = (covered * 255 / (SS * SS)) as u8;
+            }
         }
     }
     out
@@ -273,17 +323,35 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_has_a_transparent_corner_an_orange_disc_and_a_status_dot() {
-        let size = 32;
+    fn icon_is_the_app_icon_with_the_state_worked_in() {
+        let size = 64;
         let at = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
             pixels[((y * size + x) * 4) as usize..][..4].try_into().unwrap()
         };
         let on = icon_rgba(size, Indicator::On);
         assert_eq!(on.len(), (size * size * 4) as usize);
         assert_eq!(at(&on, 0, 0)[3], 0, "rounded corner is transparent");
-        assert_eq!(at(&on, 14, 14), [0xff, 0x7a, 0x2f, 255], "disc is accent orange");
-        assert_eq!(at(&on, 24, 24), [0x3e, 0xcf, 0x8e, 255], "dot is green while sharing");
+        assert_eq!(at(&on, 32, 28), [0xff, 0x7a, 0x2f, 255], "the flame burns while sharing");
+        assert_eq!(at(&on, 20, 20), [0x1b, 0x20, 0x2b, 255], "screen");
+
         let off = icon_rgba(size, Indicator::Off);
-        assert_eq!(at(&off, 24, 24), [0x8b, 0x93, 0xa3, 255], "dot is grey while off");
+        assert_eq!(at(&off, 32, 28), [0x6b, 0x73, 0x82, 255], "the flame is grey while off");
+
+        // Same icon as "on", plus a badge in the corner.
+        let connected = icon_rgba(size, Indicator::Connected);
+        assert_eq!(at(&connected, 32, 28), at(&on, 32, 28));
+        assert_eq!(at(&connected, 49, 49), [0x3e, 0xcf, 0x8e, 255], "green badge when someone is connected");
+        assert_eq!(at(&icon_rgba(size, Indicator::Attention), 49, 49), [0xf2, 0xc1, 0x4e, 255]);
+        assert_ne!(at(&on, 49, 49), at(&connected, 49, 49));
+    }
+
+    /// The window, shortcut and installer use assets/icon.png; the tray draws the same picture.
+    #[test]
+    fn tray_icon_matches_the_bundled_app_icon() {
+        let png = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap();
+        assert_eq!((png.width, png.height), (256, 256));
+        let drawn = icon_rgba(256, Indicator::On);
+        let worst = png.rgba.iter().zip(&drawn).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
+        assert!(worst <= 2, "tray icon differs from the app icon by up to {worst}");
     }
 }

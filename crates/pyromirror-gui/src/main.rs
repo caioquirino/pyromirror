@@ -10,6 +10,7 @@ mod agent;
 mod autostart;
 mod config;
 mod daemon;
+mod notify;
 mod process;
 mod state;
 mod tray;
@@ -50,6 +51,21 @@ fn main() -> eframe::Result {
         .iter()
         .position(|a| a == "--screenshot")
         .and_then(|i| args.get(i + 1).map(|path| (PathBuf::from(path), args.get(i + 2).cloned())));
+
+    // `--dump-icons <dir>` writes the tray icon in each state as PPM images, for checking them.
+    if let Some(dir) = args.iter().position(|a| a == "--dump-icons").and_then(|i| args.get(i + 1)) {
+        use tray::Indicator::*;
+        for (name, indicator) in [("off", Off), ("on", On), ("connected", Connected), ("attention", Attention)] {
+            for size in [16u32, 32, 64] {
+                let rgba = tray::icon_rgba(size, indicator);
+                // Composite on a taskbar-like grey so transparency is visible.
+                let mut ppm = format!("P6\n{size} {size}\n255\n").into_bytes();
+                ppm.extend(rgba.chunks_exact(4).flat_map(|p| [0, 1, 2].map(|c| ((p[c] as u32 * p[3] as u32 + 60 * (255 - p[3] as u32)) / 255) as u8)));
+                let _ = std::fs::write(format!("{dir}/{name}-{size}.ppm"), ppm);
+            }
+        }
+        return Ok(());
+    }
 
     // Background mode: tray icon and optional auto-sharing, no window. This is what runs at login.
     if args.iter().any(|a| a == "--background") {
@@ -161,6 +177,8 @@ struct App {
     sharing_expected: bool,
     agent: Daemon,
     window: Daemon,
+    /// Notifies about connections while the tray agent is not running to do it.
+    announcer: notify::Announcer,
     /// A running `pyromirror-server --check-permissions`, started by ticking "share automatically".
     permission_check: Option<Process>,
     permission_error: Vec<LogLine>,
@@ -234,6 +252,7 @@ impl App {
             sharing_expected: false,
             agent: Daemon::agent(),
             window: Daemon::window(),
+            announcer: notify::Announcer::default(),
             permission_check: None,
             permission_error: Vec::new(),
             client: None,
@@ -284,6 +303,10 @@ impl App {
             self.server_polled = std::time::Instant::now();
             self.server_running = self.server.is_running();
             self.server_log = self.server.log();
+            if !self.agent.is_running() && self.demo.is_none() {
+                let state = if self.server_running { host_state(&self.server_log) } else { HostState::Stopped };
+                self.announcer.observe(&state);
+            }
             if self.server_running {
                 // Started by us or by the tray agent; either way a later exit is unexpected.
                 self.sharing_expected = true;
@@ -464,7 +487,7 @@ impl App {
         }
         error_box(ui, &self.client_error);
 
-        if self.client.is_none() && ui.link(RichText::new("Fullscreen, mouse and sound options are in Settings").small()).clicked() {
+        if self.client.is_none() && ui.link(RichText::new("Fullscreen, mouse and sound: Client Options in Settings").small()).clicked() {
             self.config.tab = Tab::Settings;
             self.config.settings_page = SettingsPage::Connecting;
         }
@@ -710,7 +733,7 @@ impl App {
 
     fn sharing_settings(&mut self, ui: &mut egui::Ui) {
         let sharing = self.server_running || self.demo.is_some();
-        Self::scope_note(ui, "These apply when another computer connects to this one. They do not change what you see when you control another computer.");
+        Self::scope_note(ui, "Host Options apply when this computer is the one being shared. They do not change what you see when you control another computer.");
         if sharing {
             ui.label(RichText::new("Sharing is on, so most of these are locked. Stop sharing to change them.").color(YELLOW).small());
         }
@@ -773,7 +796,7 @@ impl App {
     }
 
     fn connecting_settings(&mut self, ui: &mut egui::Ui) {
-        Self::scope_note(ui, "These apply when you control another computer from this one. Picture quality is decided by the computer you connect to.");
+        Self::scope_note(ui, "Client Options apply when you control another computer from this one. Picture quality is decided by the computer you connect to.");
 
         card(ui, |ui| {
             section(ui, "The remote desktop window");
@@ -1165,8 +1188,8 @@ impl eframe::App for App {
                     ui,
                     &mut self.config.settings_page,
                     &[
-                        (SettingsPage::Sharing, "When sharing", None),
-                        (SettingsPage::Connecting, "When connecting", None),
+                        (SettingsPage::Sharing, "Host Options", None),
+                        (SettingsPage::Connecting, "Client Options", None),
                         (SettingsPage::General, "General", None),
                     ],
                     13.0,

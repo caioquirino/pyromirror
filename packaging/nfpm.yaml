@@ -37,8 +37,8 @@ contents:
     type: symlink
   - src: packaging/linux/pyromirror.desktop
     dst: /usr/share/applications/pyromirror.desktop
-  - src: packaging/linux/pyromirror.svg
-    dst: /usr/share/icons/hicolor/scalable/apps/pyromirror.svg
+  - src: packaging/linux/pyromirror.png
+    dst: /usr/share/icons/hicolor/256x256/apps/pyromirror.png
   - src: LICENSE
     dst: /usr/share/licenses/pyromirror/LICENSE
   - src: NOTICE
