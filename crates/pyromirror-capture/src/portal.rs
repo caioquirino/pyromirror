@@ -48,6 +48,8 @@ pub(crate) struct PortalStream {
     /// PipeWire remote restricted to the granted stream. Ownership passes to the native backend.
     pub pipewire_fd: RawFd,
     pub pipewire_node: u32,
+    /// Whether the desktop handed out a restore token, i.e. will not ask again next time.
+    pub remembered: bool,
 }
 
 fn token_path(name: &str) -> Option<PathBuf> {
@@ -101,7 +103,7 @@ fn monitor_sources() -> SelectSourcesOptions {
 
 /// Screen cast plus keyboard and pointer control. `Ok(None)` means this desktop's portal has no
 /// RemoteDesktop interface; errors after that point (e.g. the user declining) are final.
-async fn open_remote(screencast: &Screencast) -> Result<Option<(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64)>, CaptureError> {
+async fn open_remote(screencast: &Screencast) -> Result<Option<(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64, bool)>, CaptureError> {
     // The portal is D-Bus activated, so a missing interface only shows up on the first call.
     let Ok(remote) = RemoteDesktop::new().await else { return Ok(None) };
     let session = match remote.create_session(Default::default()).await {
@@ -136,6 +138,7 @@ async fn open_remote(screencast: &Screencast) -> Result<Option<(Session<RemoteDe
         .and_then(|request| request.response())
         .map_err(|e| init_error("remote control was not granted", e))?;
     save_token(REMOTE_TOKEN, granted.restore_token());
+    let remembered = granted.restore_token().is_some();
 
     let stream = first_stream(granted.streams())?;
     let node = stream.pipe_wire_node_id();
@@ -145,10 +148,10 @@ async fn open_remote(screencast: &Screencast) -> Result<Option<(Session<RemoteDe
         .open_pipe_wire_remote(&session, Default::default())
         .await
         .map_err(|e| init_error("ScreenCast.OpenPipeWireRemote failed", e))?;
-    Ok(Some((session, remote, fd.into_raw_fd(), node, width, height)))
+    Ok(Some((session, remote, fd.into_raw_fd(), node, width, height, remembered)))
 }
 
-async fn open_view_only(screencast: &Screencast) -> Result<(Session<Screencast>, RawFd, u32), CaptureError> {
+async fn open_view_only(screencast: &Screencast) -> Result<(Session<Screencast>, RawFd, u32, bool), CaptureError> {
     let session = screencast.create_session(Default::default()).await.map_err(|e| init_error(UNAVAILABLE, e))?;
 
     let mut sources = monitor_sources();
@@ -170,13 +173,14 @@ async fn open_view_only(screencast: &Screencast) -> Result<(Session<Screencast>,
         .and_then(|request| request.response())
         .map_err(|e| init_error("screen sharing was not granted", e))?;
     save_token(SCREENCAST_TOKEN, streams.restore_token());
+    let remembered = streams.restore_token().is_some();
     let node = first_stream(streams.streams())?.pipe_wire_node_id();
 
     let fd = screencast
         .open_pipe_wire_remote(&session, Default::default())
         .await
         .map_err(|e| init_error("ScreenCast.OpenPipeWireRemote failed", e))?;
-    Ok((session, fd.into_raw_fd(), node))
+    Ok((session, fd.into_raw_fd(), node, remembered))
 }
 
 pub(crate) fn open() -> Result<PortalStream, CaptureError> {
@@ -190,24 +194,24 @@ pub(crate) fn open() -> Result<PortalStream, CaptureError> {
         .map_err(|e| init_error("failed to start the portal runtime", e))?;
 
     enum Opened {
-        Remote(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64),
-        ViewOnly(Session<Screencast>, RawFd, u32),
+        Remote(Session<RemoteDesktop>, RemoteDesktop, RawFd, u32, f64, f64, bool),
+        ViewOnly(Session<Screencast>, RawFd, u32, bool),
     }
 
     let (screencast, opened) = runtime.block_on(async {
         let screencast = Screencast::new().await.map_err(|e| init_error(UNAVAILABLE, e))?;
         let opened = match open_remote(&screencast).await? {
-            Some((session, remote, fd, node, w, h)) => Opened::Remote(session, remote, fd, node, w, h),
+            Some((session, remote, fd, node, w, h, remembered)) => Opened::Remote(session, remote, fd, node, w, h, remembered),
             None => {
-                let (session, fd, node) = open_view_only(&screencast).await?;
-                Opened::ViewOnly(session, fd, node)
+                let (session, fd, node, remembered) = open_view_only(&screencast).await?;
+                Opened::ViewOnly(session, fd, node, remembered)
             }
         };
         Ok::<_, CaptureError>((screencast, opened))
     })?;
 
     Ok(match opened {
-        Opened::Remote(session, proxy, pipewire_fd, node, width, height) => PortalStream {
+        Opened::Remote(session, proxy, pipewire_fd, node, width, height, remembered) => PortalStream {
             session: PortalSession::Remote(Arc::new(RemoteControl {
                 session,
                 proxy,
@@ -219,11 +223,13 @@ pub(crate) fn open() -> Result<PortalStream, CaptureError> {
             })),
             pipewire_fd,
             pipewire_node: node,
+            remembered,
         },
-        Opened::ViewOnly(session, pipewire_fd, pipewire_node) => PortalStream {
+        Opened::ViewOnly(session, pipewire_fd, pipewire_node, remembered) => PortalStream {
             session: PortalSession::ViewOnly(ViewOnly { _session: session, _proxy: screencast, _runtime: runtime }),
             pipewire_fd,
             pipewire_node,
+            remembered,
         },
     })
 }

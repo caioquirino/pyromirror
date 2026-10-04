@@ -3,6 +3,7 @@
 //! Captures the desktop, encodes it with PyroWave and streams the packets over UDP. A TCP
 //! connection per client carries the handshake and input events.
 
+mod permissions;
 mod source;
 
 use std::io::Write;
@@ -92,6 +93,10 @@ struct Args {
     /// Ignore the client's mouse and keyboard (view-only)
     #[arg(long)]
     no_input: bool,
+
+    /// Check that sharing can start unattended (asking for any permission now), then exit
+    #[arg(long)]
+    check_permissions: bool,
 
     /// Stream a generated WIDTHxHEIGHT test pattern instead of the desktop, e.g. 1920x1080
     #[arg(long, value_name = "WxH", value_parser = parse_size)]
@@ -185,6 +190,10 @@ fn main() -> anyhow::Result<()> {
     env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
     let args = Args::parse();
     pyromirror_capture::init_process();
+
+    if args.check_permissions {
+        return permissions::check(SocketAddr::new(args.bind, args.port), args.monitor, !args.no_input);
+    }
 
     let chroma = match args.chroma {
         ChromaArg::C444 => Chroma::C444,

@@ -9,15 +9,42 @@ pub enum Tab {
     #[default]
     Connect,
     Host,
+    Settings,
+}
+
+/// The pages of the Settings tab, one per situation the settings apply to.
+#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub enum SettingsPage {
+    /// When other computers connect to this one.
+    #[default]
+    Sharing,
+    /// When this computer controls another one.
+    Connecting,
+    /// The program itself, whichever way it is used.
+    General,
+}
+
+/// A computer this one can control, as listed on the Connect tab.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(default)]
+pub struct Computer {
+    /// What the computer calls itself, learned when it was added.
+    pub name: String,
+    pub address: String,
+    /// Hex id of the host, which ties this entry to its pairing. Empty for entries carried over
+    /// from the old "recent addresses" list.
+    pub id: String,
 }
 
 #[derive(Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Config {
     pub tab: Tab,
+    pub settings_page: SettingsPage,
 
     // Connect
-    pub address: String,
+    pub computers: Vec<Computer>,
+    /// Superseded by `computers`; only read to carry old entries over.
     pub recent: Vec<String>,
     pub fullscreen: bool,
     pub lock_mouse: bool,
@@ -34,13 +61,20 @@ pub struct Config {
     pub require_pairing: bool,
     pub mtu: u32,
     pub pace_factor: f64,
+
+    // Startup
+    /// Start in the tray when the user logs in.
+    pub autostart: bool,
+    /// Start sharing as soon as the tray agent starts. Only set after a permission check.
+    pub auto_share: bool,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             tab: Tab::Connect,
-            address: String::new(),
+            settings_page: SettingsPage::Sharing,
+            computers: Vec::new(),
             recent: Vec::new(),
             fullscreen: false,
             lock_mouse: false,
@@ -55,6 +89,8 @@ impl Default for Config {
             require_pairing: true,
             mtu: 1400,
             pace_factor: 2.0,
+            autostart: false,
+            auto_share: false,
         }
     }
 }
@@ -73,10 +109,21 @@ fn path() -> Option<PathBuf> {
 
 impl Config {
     pub fn load() -> Self {
-        path()
+        let mut config: Self = path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|text| serde_json::from_str(&text).ok())
-            .unwrap_or_default()
+            .unwrap_or_default();
+        config.migrate();
+        config
+    }
+
+    /// Turns the old list of recent addresses into computers.
+    fn migrate(&mut self) {
+        for address in std::mem::take(&mut self.recent) {
+            if !self.computers.iter().any(|c| c.address == address) {
+                self.computers.push(Computer { name: address.clone(), address, id: String::new() });
+            }
+        }
     }
 
     pub fn save(&self) {
@@ -90,11 +137,14 @@ impl Config {
         }
     }
 
-    /// Moves `address` to the front of the recent list.
-    pub fn remember(&mut self, address: &str) {
-        self.recent.retain(|a| a != address);
-        self.recent.insert(0, address.to_owned());
-        self.recent.truncate(5);
+    /// Adds a computer, or updates the entry for the same host (or the same address) so a
+    /// computer never appears twice.
+    pub fn remember(&mut self, computer: Computer) {
+        let same = |c: &Computer| (!computer.id.is_empty() && c.id == computer.id) || c.address == computer.address;
+        match self.computers.iter_mut().find(|c| same(c)) {
+            Some(existing) => *existing = computer,
+            None => self.computers.push(computer),
+        }
     }
 
     pub fn server_args(&self) -> Vec<String> {
@@ -126,8 +176,8 @@ impl Config {
         args
     }
 
-    pub fn client_args(&self) -> Vec<String> {
-        let mut args = vec![self.address.trim().to_owned()];
+    pub fn client_args(&self, address: &str) -> Vec<String> {
+        let mut args = vec![address.trim().to_owned()];
         if self.fullscreen {
             args.push("--fullscreen".into());
         }
@@ -154,14 +204,14 @@ mod tests {
 
     #[test]
     fn args_reflect_toggles() {
-        let mut config = Config { address: " 10.0.0.2 ".into(), ..Default::default() };
-        assert_eq!(config.client_args(), ["10.0.0.2"]);
+        let mut config = Config::default();
+        assert_eq!(config.client_args(" 10.0.0.2 "), ["10.0.0.2"]);
         config.fullscreen = true;
         config.lock_mouse = true;
         config.play_audio = false;
         config.share_audio = false;
         config.chroma_444 = false;
-        assert_eq!(config.client_args(), ["10.0.0.2", "--fullscreen", "--lock-mouse", "--no-audio"]);
+        assert_eq!(config.client_args("10.0.0.2"), ["10.0.0.2", "--fullscreen", "--lock-mouse", "--no-audio"]);
         let server = config.server_args();
         assert!(server.contains(&"--no-audio".to_string()) && !server.contains(&"--no-input".to_string()));
         assert!(!server.contains(&"--no-pairing".to_string()));
@@ -169,11 +219,23 @@ mod tests {
     }
 
     #[test]
-    fn recent_is_deduplicated_and_capped() {
-        let mut config = Config::default();
-        for host in ["a", "b", "c", "a", "d", "e", "f"] {
-            config.remember(host);
-        }
-        assert_eq!(config.recent, ["f", "e", "d", "a", "c"]);
+    fn computers_are_not_duplicated_and_old_recents_carry_over() {
+        let mut config: Config = serde_json::from_str(r#"{"recent": ["10.0.0.2", "10.0.0.3"]}"#).unwrap();
+        config.migrate();
+        assert_eq!(config.computers.len(), 2);
+        assert!(config.recent.is_empty());
+        assert_eq!(config.computers[0].name, "10.0.0.2");
+
+        // Adding the computer at a known address fills in its name and id in place.
+        let pc = Computer { name: "CAIO-PC".into(), address: "10.0.0.2".into(), id: "ab".into() };
+        config.remember(pc.clone());
+        assert_eq!(config.computers.len(), 2);
+        assert_eq!(config.computers[0], pc);
+        // The same host under a new address replaces the entry rather than adding one.
+        config.remember(Computer { address: "10.0.0.9".into(), ..pc.clone() });
+        assert_eq!(config.computers.len(), 2);
+        assert_eq!(config.computers[0].address, "10.0.0.9");
+        config.remember(Computer { name: "other".into(), address: "10.0.0.7".into(), id: "cd".into() });
+        assert_eq!(config.computers.len(), 3);
     }
 }

@@ -244,6 +244,15 @@ pub fn serve<S: Read + Write>(
     Err(AuthError::WrongCode)
 }
 
+/// The host a client got through to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Connected {
+    /// True if this connection created the pairing (a code was entered).
+    pub newly_paired: bool,
+    pub server_id: Id,
+    pub server_name: String,
+}
+
 /// Why the client is being asked for a pairing code.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CodePrompt {
@@ -255,18 +264,19 @@ pub struct CodePrompt {
 }
 
 /// Client side of the exchange. `ask_code` is called when the host shows a pairing code; it
-/// returns what the person typed, or `None` to give up. Returns true if this connection created
-/// a new pairing.
+/// returns what the person typed, or `None` to give up.
 pub fn connect<S: Read + Write>(
     stream: &mut S,
     client_id: Id,
     name: &str,
     hosts: &mut TokenStore,
     mut ask_code: impl FnMut(CodePrompt) -> Option<String>,
-) -> Result<bool, AuthError> {
+) -> Result<Connected, AuthError> {
     let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
     let len = read_typed(stream, MSG_TYPE_AUTH_CHALLENGE, &mut payload)?;
     let challenge = AuthChallenge::deserialize(&payload[..len])?;
+
+    let server_name = if challenge.name.is_empty() { "unnamed computer".to_owned() } else { challenge.name.clone() };
 
     let (method, mac) = match hosts.get(&challenge.server_id) {
         Some(token) => (AuthMethod::Token, token_proof(token, &challenge, &client_id)),
@@ -279,7 +289,7 @@ pub fn connect<S: Read + Write>(
 
     let len = read_typed(stream, MSG_TYPE_AUTH_RESULT, &mut payload)?;
     match result(&payload[..len]) {
-        AuthResult::Ok => return Ok(false),
+        AuthResult::Ok => return Ok(Connected { newly_paired: false, server_id: challenge.server_id, server_name }),
         AuthResult::CodeNeeded => {}
         AuthResult::WrongCode | AuthResult::NotPaired => return Err(AuthError::Rejected),
     }
@@ -307,9 +317,8 @@ pub fn connect<S: Read + Write>(
         match result(&payload[..len]) {
             AuthResult::Ok => {
                 // If this fails the host simply asks for a code again next time.
-                let host_name = if challenge.name.is_empty() { "unnamed computer" } else { &challenge.name };
-                let _ = hosts.insert(challenge.server_id, derive_token(&code, &challenge, &client_id), host_name);
-                return Ok(true);
+                let _ = hosts.insert(challenge.server_id, derive_token(&code, &challenge, &client_id), &server_name);
+                return Ok(Connected { newly_paired: true, server_id: challenge.server_id, server_name });
             }
             AuthResult::WrongCode => wrong_attempts += 1,
             // Out of attempts.
@@ -380,11 +389,12 @@ pub fn normalize_code(code: &str) -> String {
     code.chars().filter(|c| !c.is_whitespace() && *c != '-').collect()
 }
 
-fn to_hex(bytes: &[u8]) -> String {
+/// Lower-case hex, the form ids are stored and logged in.
+pub fn to_hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{:02x}", b)).collect()
 }
 
-fn from_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
+pub fn from_hex<const N: usize>(text: &str) -> Option<[u8; N]> {
     if text.len() != N * 2 || !text.is_ascii() {
         return None;
     }
@@ -576,6 +586,17 @@ mod tests {
         answers: Vec<Option<&'static str>>,
         type_shown_code: bool,
     ) -> (Result<Accepted, AuthError>, Result<bool, AuthError>, TokenStore, Vec<CodePrompt>) {
+        let (server, client, paired, prompts) = exchange_full(required, paired, hosts, answers, type_shown_code);
+        (server, client.map(|c| c.newly_paired), paired, prompts)
+    }
+
+    fn exchange_full(
+        required: bool,
+        paired: TokenStore,
+        hosts: &mut TokenStore,
+        answers: Vec<Option<&'static str>>,
+        type_shown_code: bool,
+    ) -> (Result<Accepted, AuthError>, Result<Connected, AuthError>, TokenStore, Vec<CodePrompt>) {
         use std::net::{TcpListener, TcpStream};
         use std::sync::mpsc;
 
@@ -680,6 +701,22 @@ mod tests {
         assert!(matches!(client, Err(AuthError::Cancelled)));
         assert!(paired.is_empty());
 
+        for dir in [dir_a, dir_b] {
+            let _ = std::fs::remove_dir_all(dir);
+        }
+    }
+
+    #[test]
+    fn the_client_learns_which_host_it_reached() {
+        let (paired, dir_a) = temp_store("paired-clients");
+        let (mut hosts, dir_b) = temp_store("paired-hosts");
+        let (_, client, paired, _) = exchange_full(true, paired, &mut hosts, vec![], true);
+        let expected = Connected { newly_paired: true, server_id: [7; 16], server_name: "host-pc".into() };
+        assert_eq!(client.unwrap(), expected);
+        // Same answer, minus the pairing, when it is already known.
+        let (_, client, _, _) = exchange_full(true, paired, &mut hosts, vec![], false);
+        assert_eq!(client.unwrap(), Connected { newly_paired: false, ..expected });
+        assert_eq!(from_hex::<16>(&to_hex(&[7u8; 16])), Some([7u8; 16]));
         for dir in [dir_a, dir_b] {
             let _ = std::fs::remove_dir_all(dir);
         }

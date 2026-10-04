@@ -6,8 +6,13 @@
 
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod agent;
+mod autostart;
 mod config;
+mod daemon;
 mod process;
+mod state;
+mod tray;
 
 use std::path::PathBuf;
 
@@ -15,8 +20,10 @@ use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 
 use pyromirror_proto::auth::{self, TokenStore};
 
-use config::{Config, Tab};
+use config::{Computer, Config, SettingsPage, Tab};
+use daemon::Daemon;
 use process::{Level, LogLine, Process};
+use state::{client_state, host_state, ClientState, HostState};
 
 const BG: Color32 = Color32::from_rgb(0x12, 0x15, 0x1c);
 const CARD: Color32 = Color32::from_rgb(0x1b, 0x20, 0x2b);
@@ -43,6 +50,18 @@ fn main() -> eframe::Result {
         .iter()
         .position(|a| a == "--screenshot")
         .and_then(|i| args.get(i + 1).map(|path| (PathBuf::from(path), args.get(i + 2).cloned())));
+
+    // Background mode: tray icon and optional auto-sharing, no window. This is what runs at login.
+    if args.iter().any(|a| a == "--background") {
+        agent::run();
+        return Ok(());
+    }
+
+    // One window is enough; a second start (e.g. from the tray) just returns.
+    let window = Daemon::window();
+    if screenshot.is_none() && !window.claim() {
+        return Ok(());
+    }
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
@@ -104,75 +123,8 @@ fn apply_theme(ctx: &egui::Context) {
     });
 }
 
-/// What the server is doing, as far as its log tells.
-#[derive(Clone, PartialEq)]
-enum HostState {
-    Stopped,
-    Starting,
-    WaitingForPermission,
-    Ready,
-    /// An unknown computer wants to connect; the code has to be typed on it.
-    PairingRequest { name: String, code: String },
-    Serving(String),
-    Failed,
-}
-
-fn host_state(log: &[LogLine]) -> HostState {
-    let mut state = HostState::Starting;
-    let mut peer = String::new();
-    for line in log {
-        let text = line.text.as_str();
-        if text.starts_with("Waiting for") && text.contains("permission") {
-            state = HostState::WaitingForPermission;
-        } else if text.starts_with("Listening on") {
-            state = HostState::Ready;
-        } else if let Some(address) = text.strip_prefix("Client connected from ") {
-            // Drop the ephemeral TCP port; the address is what people recognise. Until the
-            // client has been accepted nothing is being shared with it yet.
-            peer = address.rsplit_once(':').map_or(address, |(host, _)| host).to_owned();
-        } else if let Some((name, code)) = text.strip_prefix("Pairing request from ").and_then(|r| r.rsplit_once(": code ")) {
-            // Formatted for reading across the room: "123 456".
-            let code = if code.len() == 6 { format!("{} {}", &code[..3], &code[3..]) } else { code.to_owned() };
-            state = HostState::PairingRequest { name: name.to_owned(), code };
-        } else if let Some(name) = text.strip_prefix("Accepted ") {
-            state = HostState::Serving(if peer.is_empty() { name.to_owned() } else { format!("{} ({})", name, peer) });
-        } else if text.ends_with(" disconnected") || text.starts_with("Session with ") {
-            state = HostState::Ready;
-        }
-    }
-    state
-}
-
 fn pairing_file(name: &str) -> PathBuf {
     auth::config_dir().unwrap_or_else(std::env::temp_dir).join(name)
-}
-
-/// What the viewer is doing, as far as its log tells.
-#[derive(Clone, PartialEq)]
-enum ClientState {
-    Connecting,
-    /// The host is showing a pairing code that has to be typed here. `revoked` means this
-    /// computer used to be paired and the host has removed it.
-    CodeNeeded { wrong: bool, revoked: bool },
-    Connected,
-}
-
-fn client_state(log: &[LogLine]) -> ClientState {
-    let mut state = ClientState::Connecting;
-    let (mut wrong, mut revoked) = (false, false);
-    for line in log {
-        let text = line.text.as_str();
-        if text.starts_with("Wrong pairing code") {
-            wrong = true;
-        } else if text.contains("no longer paired with the host") {
-            revoked = true;
-        } else if text.starts_with("Pairing code needed") {
-            state = ClientState::CodeNeeded { wrong, revoked };
-        } else if text.starts_with("Stream: ") {
-            state = ClientState::Connected;
-        }
-    }
-    state
 }
 
 /// This computer's address on the network it would use to reach others. No packet is sent:
@@ -184,15 +136,44 @@ fn local_address() -> Option<String> {
     (!ip.is_unspecified() && !ip.is_loopback()).then(|| ip.to_string())
 }
 
+/// "Add a computer": takes an address, pairs with the computer there, and saves it.
+#[derive(Default)]
+struct AddDialog {
+    address: String,
+    /// `pyromirror-client --pair-only`, while it is talking to the other computer.
+    pairing: Option<Process>,
+    code: String,
+    codes_sent: usize,
+    error: Vec<LogLine>,
+}
+
 struct App {
     config: Config,
     saved: Config,
-    server: Option<Process>,
+    /// The sharing server. It runs detached, so the tray agent can keep it going (and control
+    /// it) while this window is closed; what we show is read from its pid and log files.
+    server: Daemon,
+    server_running: bool,
+    server_log: Vec<LogLine>,
+    server_polled: std::time::Instant,
+    /// True between starting the server and noticing it gone, to tell a crash from "off".
+    sharing_expected: bool,
+    agent: Daemon,
+    window: Daemon,
+    /// A running `pyromirror-server --check-permissions`, started by ticking "share automatically".
+    permission_check: Option<Process>,
+    permission_error: Vec<LogLine>,
     client: Option<Process>,
     /// Last lines of a process that stopped on its own with an error.
     server_error: Vec<LogLine>,
     client_error: Vec<LogLine>,
     local_address: Option<String>,
+    /// The computer the viewer is (being) connected to: name and address.
+    target: (String, String),
+    /// The "Add a computer" dialog, while it is open.
+    add: Option<AddDialog>,
+    /// Index of the computer whose "Remove" is waiting for confirmation.
+    confirm_remove: Option<usize>,
     /// Pairing code being typed into the prompt on the Connect tab.
     pairing_code: String,
     /// How many pairing prompts of the current connection have been answered, so that an
@@ -207,6 +188,7 @@ struct App {
     /// The entry whose "Forget" was clicked and is waiting for confirmation.
     confirm_forget: Option<auth::Id>,
     screenshot: Option<PathBuf>,
+    scroll_to_bottom: bool,
     /// Screenshot mode only: pretend the server is in this state.
     demo: Option<HostState>,
     frames: u32,
@@ -217,8 +199,22 @@ impl App {
         let mut config = Config::load();
         let saved = config.clone();
         let mut demo = None;
+        let open_add = screenshot.as_ref().is_some_and(|(_, tab)| tab.as_deref() == Some("connect-add"));
+        let scroll_to_bottom = screenshot.as_ref().is_some_and(|(_, tab)| tab.as_deref() == Some("host-bottom"));
         let screenshot = screenshot.map(|(path, tab)| {
-            config.tab = if tab.as_deref().is_some_and(|t| t.starts_with("host")) { Tab::Host } else { Tab::Connect };
+            let tab_name = tab.as_deref().unwrap_or("connect");
+            config.tab = if tab_name.starts_with("host") {
+                Tab::Host
+            } else if tab_name.starts_with("settings") {
+                Tab::Settings
+            } else {
+                Tab::Connect
+            };
+            config.settings_page = match tab_name {
+                "settings-connecting" => SettingsPage::Connecting,
+                "settings-general" => SettingsPage::General,
+                _ => SettingsPage::Sharing,
+            };
             demo = match tab.as_deref() {
                 Some("host-ready") => Some(HostState::Ready),
                 Some("host-serving") => Some(HostState::Serving("caio-laptop (192.168.1.7)".into())),
@@ -227,14 +223,25 @@ impl App {
             };
             path
         });
-        Self {
+        let mut app = Self {
             config,
             saved,
-            server: None,
+            server: Daemon::server(),
+            server_running: false,
+            server_log: Vec::new(),
+            server_polled: std::time::Instant::now() - std::time::Duration::from_secs(60),
+            sharing_expected: false,
+            agent: Daemon::agent(),
+            window: Daemon::window(),
+            permission_check: None,
+            permission_error: Vec::new(),
             client: None,
             server_error: Vec::new(),
             client_error: Vec::new(),
             local_address: local_address(),
+            target: (String::new(), String::new()),
+            add: open_add.then(AddDialog::default),
+            confirm_remove: None,
             pairing_code: String::new(),
             codes_sent: 0,
             was_pairing: false,
@@ -243,24 +250,80 @@ impl App {
             stores_read: std::time::Instant::now(),
             confirm_forget: None,
             screenshot,
+            scroll_to_bottom,
             demo,
             frames: 0,
+        };
+        if app.screenshot.is_none() {
+            if app.config.autostart && !autostart::is_set() {
+                // The login entry was removed outside PyroMirror; go along with that.
+                app.config.autostart = false;
+                app.config.auto_share = false;
+            } else if app.config.autostart {
+                // Keep the entry pointing at this copy of the program, and the tray icon up.
+                app.apply_autostart();
+            }
+        }
+        app
+    }
+
+    /// The last few lines of a log, for showing why something failed.
+    fn failure(log: &[LogLine]) -> Vec<LogLine> {
+        let mut lines = log[log.len().saturating_sub(6)..].to_vec();
+        if lines.is_empty() {
+            lines.push(LogLine { level: Level::Error, text: "The program exited unexpectedly.".into() });
+        }
+        lines
+    }
+
+    /// Refreshes what we know about the server, and notices processes that ended by themselves,
+    /// keeping what they said if they failed.
+    fn reap(&mut self) {
+        if self.server_polled.elapsed() >= std::time::Duration::from_millis(300) {
+            self.server_polled = std::time::Instant::now();
+            self.server_running = self.server.is_running();
+            self.server_log = self.server.log();
+            if self.server_running {
+                // Started by us or by the tray agent; either way a later exit is unexpected.
+                self.sharing_expected = true;
+            } else if self.sharing_expected {
+                self.sharing_expected = false;
+                if self.server_log.iter().any(|l| l.level == Level::Error) {
+                    self.server_error = Self::failure(&self.server_log);
+                }
+            }
+        }
+
+        if let Some(success) = self.client.as_mut().and_then(|p| p.exited()) {
+            if !success {
+                self.client_error = Self::failure(&self.client.as_ref().map(|p| p.log()).unwrap_or_default());
+            }
+            self.client = None;
+        }
+
+        if let Some(success) = self.permission_check.as_mut().and_then(|p| p.exited()) {
+            if success {
+                self.config.auto_share = true;
+            } else {
+                self.permission_error = Self::failure(&self.permission_check.as_ref().map(|p| p.log()).unwrap_or_default());
+            }
+            self.permission_check = None;
         }
     }
 
-    /// Notices processes that ended by themselves and keeps what they said if they failed.
-    fn reap(&mut self) {
-        for (process, error) in [(&mut self.server, &mut self.server_error), (&mut self.client, &mut self.client_error)] {
-            if let Some(success) = process.as_mut().and_then(|p| p.exited()) {
-                if !success {
-                    let log = process.as_ref().map(|p| p.log()).unwrap_or_default();
-                    *error = log[log.len().saturating_sub(6)..].to_vec();
-                    if error.is_empty() {
-                        error.push(LogLine { level: Level::Error, text: "The program exited unexpectedly.".into() });
-                    }
-                }
-                *process = None;
+    /// Applies the "start at login" setting: the login entry, and the tray agent right now.
+    fn apply_autostart(&mut self) {
+        if let Err(e) = autostart::set(self.config.autostart) {
+            log::warn!("Could not change the startup entry: {}", e);
+        }
+        if self.config.autostart {
+            if let Err(e) = self.agent.start(&["--background".to_owned()]) {
+                log::warn!("Could not start the tray icon: {}", e);
             }
+        } else {
+            self.agent.stop();
+            // Sharing at login needs the agent.
+            self.config.auto_share = false;
         }
     }
 
@@ -279,8 +342,13 @@ impl App {
         if let Some(client) = &mut self.client {
             let log = client.log();
             let prompts = log.iter().filter(|l| l.text.starts_with("Pairing code needed")).count();
-            let address = self.config.address.trim().to_owned();
+            let address = self.target.0.clone();
             let mut stop = false;
+            // Once the host has identified itself, keep its entry current: its name may have
+            // changed, and entries carried over from older versions have no id yet.
+            if let Some((id, name)) = log.iter().find_map(|l| l.text.strip_prefix("Host: ")).and_then(|r| r.split_once(' ')) {
+                self.config.remember(Computer { name: name.to_owned(), address: self.target.1.clone(), id: id.to_owned() });
+            }
 
             match client_state(&log) {
                 ClientState::CodeNeeded { wrong, revoked } if prompts > self.codes_sent => {
@@ -331,64 +399,74 @@ impl App {
                 self.client = None;
             }
         } else {
-            let (color, title) = if self.client_error.is_empty() {
-                (MUTED, "Not connected")
-            } else {
-                (RED, "The connection ended with an error")
-            };
-            let connect = state_panel(ui, color, title, "Enter the address shown on the computer you want to control. The first time, it will ask you for a pairing code.", |ui| {
-                let field = ui.add(
-                    egui::TextEdit::singleline(&mut self.config.address)
-                        .hint_text("Address, e.g. 192.168.1.20")
-                        .desired_width(f32::INFINITY)
-                        .margin(Margin::symmetric(10, 9)),
-                );
-                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
-
-                if !self.config.recent.is_empty() {
-                    ui.horizontal_wrapped(|ui| {
-                        ui.label(RichText::new("Recent:").color(MUTED).small());
-                        for address in self.config.recent.clone() {
-                            if ui.link(RichText::new(&address).small()).clicked() {
-                                self.config.address = address;
-                            }
-                        }
-                    });
+            let mut connect_to = None;
+            let mut remove = None;
+            card(ui, |ui| {
+                section(ui, "Computers you can control");
+                if self.config.computers.is_empty() {
+                    ui.label(RichText::new("None yet. Add the computer you want to control; it has to be sharing at that moment.").color(MUTED));
                 }
-
-                let ready = !self.config.address.trim().is_empty();
-                let clicked = ui.add_enabled_ui(ready, |ui| action_button(ui, "Connect", ButtonKind::Primary).clicked()).inner;
-                ready && (clicked || enter)
+                for (index, computer) in self.config.computers.iter().enumerate() {
+                    ui.horizontal(|ui| {
+                        ui.vertical(|ui| {
+                            ui.spacing_mut().item_spacing.y = 0.0;
+                            ui.label(RichText::new(&computer.name).strong());
+                            if computer.address != computer.name {
+                                ui.label(RichText::new(&computer.address).color(MUTED).small());
+                            }
+                        });
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if self.confirm_remove == Some(index) {
+                                // Right-to-left: listed in reverse of how they read.
+                                if ui.link("Keep").clicked() {
+                                    self.confirm_remove = None;
+                                }
+                                if ui.link(RichText::new("Yes, remove").color(RED)).clicked() {
+                                    remove = Some(index);
+                                }
+                            } else {
+                                let button = egui::Button::new(RichText::new("Connect").color(Color32::BLACK)).fill(ACCENT);
+                                if ui.add(button).clicked() {
+                                    connect_to = Some(computer.clone());
+                                }
+                                if ui.link(RichText::new("Remove").color(MUTED)).clicked() {
+                                    self.confirm_remove = Some(index);
+                                }
+                            }
+                        });
+                    });
+                    ui.add_space(2.0);
+                }
             });
-            if connect {
-                let address = self.config.address.trim().to_owned();
-                self.config.remember(&address);
+
+            if action_button(ui, "Add a computer", ButtonKind::Secondary).clicked() {
+                self.add = Some(AddDialog::default());
+            }
+
+            if let Some(index) = remove {
+                let computer = self.config.computers.remove(index);
+                // Forget the pairing too, so it really is gone; the other computer will ask for
+                // a code if it is ever added again.
+                if let Some(id) = auth::from_hex::<16>(&computer.id) {
+                    let _ = self.paired_hosts.remove(&id);
+                }
+                self.confirm_remove = None;
+            }
+            if let Some(computer) = connect_to {
+                self.target = (computer.name.clone(), computer.address.clone());
                 self.pairing_code.clear();
                 self.codes_sent = 0;
-                self.client = Self::start("pyromirror-client", &self.config.client_args(), ui.ctx(), &mut self.client_error);
+                self.confirm_remove = None;
+                self.client =
+                    Self::start("pyromirror-client", &self.config.client_args(&computer.address), ui.ctx(), &mut self.client_error);
             }
         }
         error_box(ui, &self.client_error);
 
-        ui.add_space(4.0);
-        ui.add_enabled_ui(self.client.is_none(), |ui| {
-            card(ui, |ui| {
-                section(ui, "Options");
-                ui.checkbox(&mut self.config.fullscreen, "Start in fullscreen");
-                ui.checkbox(&mut self.config.lock_mouse, "Keep the mouse inside the window");
-                ui.checkbox(&mut self.config.play_audio, "Play the remote computer's sound");
-            });
-        });
-
-        ui.add_space(4.0);
-        paired_card(
-            ui,
-            "Computers you are paired with",
-            "None yet. The first time you connect to a computer it will ask for a pairing code.",
-            "Removing one means it will ask for a pairing code again.",
-            &mut self.paired_hosts,
-            &mut self.confirm_forget,
-        );
+        if self.client.is_none() && ui.link(RichText::new("Fullscreen, mouse and sound options are in Settings").small()).clicked() {
+            self.config.tab = Tab::Settings;
+            self.config.settings_page = SettingsPage::Connecting;
+        }
 
         ui.add_space(4.0);
         card(ui, |ui| {
@@ -411,12 +489,124 @@ impl App {
     }
 
     /// Colour, headline and explanation for the sharing side.
+    /// The "Add a computer" dialog: address first, then (if the other computer asks) its pairing
+    /// code. The computer is only saved once pairing has gone through.
+    fn add_dialog(&mut self, ctx: &egui::Context) {
+        let Some(dialog) = &mut self.add else { return };
+        let mut close = false;
+        let mut added = None;
+
+        // Has the pairing run finished?
+        if let Some(success) = dialog.pairing.as_mut().and_then(|p| p.exited()) {
+            let log = dialog.pairing.as_ref().map(|p| p.log()).unwrap_or_default();
+            dialog.pairing = None;
+            let host = log.iter().find_map(|l| l.text.strip_prefix("Host: ")).and_then(|rest| rest.split_once(' '));
+            match (success, host) {
+                (true, Some((id, name))) => {
+                    added = Some(Computer { name: name.to_owned(), address: dialog.address.trim().to_owned(), id: id.to_owned() });
+                }
+                _ => dialog.error = Self::failure(&log),
+            }
+        }
+
+        let modal = egui::Modal::new(egui::Id::new("add-computer")).show(ctx, |ui| {
+            ui.set_width(360.0);
+            ui.label(RichText::new("Add a computer").size(18.0).strong());
+            ui.add_space(4.0);
+
+            let Some(pairing) = &mut dialog.pairing else {
+                // Step 1: where is it?
+                ui.label(RichText::new("On the other computer, open PyroMirror and start sharing. It shows the address to enter here.").color(MUTED));
+                let field = ui.add(
+                    egui::TextEdit::singleline(&mut dialog.address)
+                        .hint_text("Address, e.g. 192.168.1.20")
+                        .desired_width(f32::INFINITY)
+                        .margin(Margin::symmetric(10, 9)),
+                );
+                if dialog.address.is_empty() && dialog.error.is_empty() && !field.has_focus() {
+                    field.request_focus();
+                }
+                let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                error_box(ui, &dialog.error);
+
+                let ready = !dialog.address.trim().is_empty();
+                let add = ui.add_enabled_ui(ready, |ui| action_button(ui, "Add", ButtonKind::Primary).clicked()).inner;
+                if ready && (add || enter) {
+                    dialog.error.clear();
+                    dialog.code.clear();
+                    dialog.codes_sent = 0;
+                    let args = [dialog.address.trim().to_owned(), "--pair-only".to_owned()];
+                    dialog.pairing = Self::start("pyromirror-client", &args, ui.ctx(), &mut dialog.error);
+                }
+                if ui.link("Cancel").clicked() {
+                    close = true;
+                }
+                return;
+            };
+
+            // Step 2: talking to it; it may ask for its pairing code.
+            let log = pairing.log();
+            let prompts = log.iter().filter(|l| l.text.starts_with("Pairing code needed")).count();
+            match client_state(&log) {
+                ClientState::CodeNeeded { wrong, .. } if prompts > dialog.codes_sent => {
+                    let text = if wrong {
+                        "That code was not right. Check the code shown on the other computer and try again."
+                    } else {
+                        "The other computer is now showing a pairing code. Type it here."
+                    };
+                    ui.label(RichText::new(text).color(if wrong { RED } else { MUTED }));
+                    let field = ui.add(
+                        egui::TextEdit::singleline(&mut dialog.code)
+                            .hint_text("123 456")
+                            .font(egui::FontId::monospace(22.0))
+                            .desired_width(f32::INFINITY)
+                            .margin(Margin::symmetric(10, 9)),
+                    );
+                    if dialog.code.is_empty() && !field.has_focus() {
+                        field.request_focus();
+                    }
+                    let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    let ready = dialog.code.chars().filter(|c| c.is_ascii_digit()).count() == 6;
+                    let pair = ui.add_enabled_ui(ready, |ui| action_button(ui, "Pair", ButtonKind::Primary).clicked()).inner;
+                    if ready && (pair || enter) {
+                        pairing.send_line(dialog.code.trim());
+                        dialog.codes_sent = prompts;
+                        dialog.code.clear();
+                    }
+                }
+                _ => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label(format!("Contacting {}...", dialog.address.trim()));
+                    });
+                }
+            }
+            if ui.link("Cancel").clicked() {
+                close = true;
+            }
+        });
+        // Clicking outside or pressing Escape, but not in the middle of typing a code.
+        if modal.should_close() && dialog.pairing.is_none() {
+            close = true;
+        }
+
+        if let Some(computer) = added {
+            self.config.remember(computer);
+            self.paired_hosts.reload();
+            close = true;
+        }
+        if close {
+            // Dropping the dialog ends a pairing that is still running.
+            self.add = None;
+        }
+    }
+
     fn sharing_summary(&self) -> (HostState, Color32, String, String) {
-        let state = match &self.server {
-            None if self.demo.is_some() => self.demo.clone().unwrap(),
+        let state = match &self.demo {
+            Some(demo) => demo.clone(),
+            None if self.server_running => host_state(&self.server_log),
             None if self.server_error.is_empty() => HostState::Stopped,
             None => HostState::Failed,
-            Some(server) => host_state(&server.log()),
         };
         let address = self.local_address.as_ref().map(|address| {
             if self.config.port == 9000 { address.clone() } else { format!("{}:{}", address, self.config.port) }
@@ -448,9 +638,161 @@ impl App {
         (state, color, title, detail)
     }
 
+    /// "Start at login" and "share automatically". The second can only be switched on by
+    /// passing a permission check, so that an unattended start never hangs on a dialog.
+    fn startup_card(&mut self, ui: &mut egui::Ui, sharing: bool) {
+        card(ui, |ui| {
+            section(ui, "Startup");
+
+            let mut autostart = self.config.autostart;
+            if ui.checkbox(&mut autostart, "Start PyroMirror in the tray when I log in").changed() {
+                self.config.autostart = autostart;
+                self.apply_autostart();
+            }
+
+            if self.permission_check.is_some() {
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Checking permissions...");
+                });
+                ui.label(RichText::new("Your system may ask you to allow screen sharing, remote control or network access. Say yes, and choose to remember it if offered.").color(YELLOW).small());
+                if ui.link("Cancel").clicked() {
+                    self.permission_check = None;
+                }
+                return;
+            }
+
+            let mut auto_share = self.config.auto_share;
+            // Needs the tray agent, and the check needs the port, so sharing must be off.
+            let can_change = self.config.autostart && (auto_share || !sharing);
+            let changed = ui.add_enabled(can_change, egui::Checkbox::new(&mut auto_share, "Start sharing this computer automatically at login")).changed();
+            if changed && !auto_share {
+                self.config.auto_share = false;
+            } else if changed {
+                // Not enabled yet: first prove that sharing can start without anyone answering
+                // a dialog. The setting is switched on when the check passes.
+                self.permission_error.clear();
+                let mut args = self.config.server_args();
+                args.push("--check-permissions".into());
+                self.permission_check = Self::start("pyromirror-server", &args, ui.ctx(), &mut self.permission_error);
+            }
+
+            let hint = if !self.config.autostart {
+                "Automatic sharing needs PyroMirror to start at login."
+            } else if self.config.auto_share {
+                "Permissions were checked. This computer can be reached after login without anyone at the desk."
+            } else if sharing {
+                "Stop sharing to switch this on: PyroMirror first checks that it has the permissions it needs."
+            } else {
+                "Switching this on first checks that PyroMirror has the permissions it needs."
+            };
+            ui.label(RichText::new(hint).color(MUTED).small());
+            error_box(ui, &self.permission_error);
+        });
+    }
+
+    /// Settings are grouped by the situation they apply to, because that is the question
+    /// people have: "does this change what I share, or what I see?"
+    fn settings_tab(&mut self, ui: &mut egui::Ui) {
+        match self.config.settings_page {
+            SettingsPage::Sharing => self.sharing_settings(ui),
+            SettingsPage::Connecting => self.connecting_settings(ui),
+            SettingsPage::General => self.general_settings(ui),
+        }
+    }
+
+    /// A line under the page tabs saying what the page governs.
+    fn scope_note(ui: &mut egui::Ui, text: &str) {
+        ui.label(RichText::new(text).color(MUTED));
+        ui.add_space(2.0);
+    }
+
+    fn sharing_settings(&mut self, ui: &mut egui::Ui) {
+        let sharing = self.server_running || self.demo.is_some();
+        Self::scope_note(ui, "These apply when another computer connects to this one. They do not change what you see when you control another computer.");
+        if sharing {
+            ui.label(RichText::new("Sharing is on, so most of these are locked. Stop sharing to change them.").color(YELLOW).small());
+        }
+
+        // Read when sharing starts, so they cannot change underneath a session.
+        ui.add_enabled_ui(!sharing, |ui| {
+            card(ui, |ui| {
+                section(ui, "Picture");
+                row(ui, "Bitrate", |ui| {
+                    ui.add(egui::Slider::new(&mut self.config.bitrate_mbps, 10..=2000).logarithmic(true).suffix(" Mbps"));
+                });
+                row(ui, "Frame rate", |ui| {
+                    segmented(ui, &mut self.config.fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120"), (144, "144")]);
+                });
+                row(ui, "Resolution", |ui| {
+                    segmented(ui, &mut self.config.scale, &[(1, "Native"), (2, "1/2"), (3, "1/3"), (4, "1/4")]);
+                });
+                row(ui, "Colour", |ui| {
+                    segmented(ui, &mut self.config.chroma_444, &[(true, "4:4:4 sharp text"), (false, "4:2:0 less data")]);
+                });
+                ui.label(RichText::new("Higher bitrate and 4:4:4 look better and need a faster network. A lower resolution helps on Wi-Fi.").color(MUTED).small());
+            });
+
+            ui.add_space(4.0);
+            card(ui, |ui| {
+                section(ui, "What the other computer gets");
+                ui.checkbox(&mut self.config.share_audio, "This computer's sound");
+                ui.checkbox(&mut self.config.allow_control, "Control of the mouse and keyboard");
+            });
+
+            ui.add_space(4.0);
+            card(ui, |ui| {
+                section(ui, "Who may connect");
+                ui.checkbox(&mut self.config.require_pairing, "Require pairing for new computers");
+                let (hint, color) = if self.config.require_pairing {
+                    ("A computer connecting for the first time has to enter a one-time code shown here.", MUTED)
+                } else {
+                    ("Anyone on your network can connect without a code.", YELLOW)
+                };
+                ui.label(RichText::new(hint).color(color).small());
+            });
+        });
+
+        ui.add_space(4.0);
+        ui.add_enabled_ui(!sharing, |ui| {
+            card(ui, |ui| {
+                section(ui, "Network");
+                row(ui, "Port", |ui| {
+                    ui.add(egui::DragValue::new(&mut self.config.port).range(1024..=65535).speed(1));
+                });
+                row(ui, "Packet size", |ui| {
+                    segmented(ui, &mut self.config.mtu, &[(1400, "1400 standard"), (8900, "8900 jumbo")]);
+                });
+                row(ui, "Pacing", |ui| {
+                    ui.add(egui::Slider::new(&mut self.config.pace_factor, 1.1..=4.0).suffix("x bitrate"));
+                });
+                ui.label(RichText::new("Jumbo packets need a network set up for them. Lower pacing is smoother on Wi-Fi; higher has less delay.").color(MUTED).small());
+            });
+        });
+    }
+
+    fn connecting_settings(&mut self, ui: &mut egui::Ui) {
+        Self::scope_note(ui, "These apply when you control another computer from this one. Picture quality is decided by the computer you connect to.");
+
+        card(ui, |ui| {
+            section(ui, "The remote desktop window");
+            ui.checkbox(&mut self.config.fullscreen, "Start in fullscreen");
+            ui.checkbox(&mut self.config.lock_mouse, "Keep the mouse inside the window");
+            ui.checkbox(&mut self.config.play_audio, "Play the other computer's sound");
+            ui.label(RichText::new("Used from the next connection. All three can also be switched from the toolbar while connected.").color(MUTED).small());
+        });
+
+    }
+
+    fn general_settings(&mut self, ui: &mut egui::Ui) {
+        Self::scope_note(ui, "These are about PyroMirror itself on this computer.");
+        let sharing = self.server_running || self.demo.is_some();
+        self.startup_card(ui, sharing);
+    }
+
     fn host_tab(&mut self, ui: &mut egui::Ui) {
-        let log = self.server.as_ref().map(|p| p.log()).unwrap_or_default();
-        let running = self.server.is_some() || self.demo.is_some();
+        let log = self.server_log.clone();
+        let running = self.server_running || self.demo.is_some();
         let (state, color, title, detail) = self.sharing_summary();
 
         let address = self.local_address.clone();
@@ -474,64 +816,44 @@ impl App {
             }
         });
         if toggle {
+            self.server_error.clear();
             if running {
-                self.server = None;
-            } else {
-                self.server = Self::start("pyromirror-server", &self.config.server_args(), ui.ctx(), &mut self.server_error);
+                self.server.stop();
+                self.sharing_expected = false;
+            } else if let Err(e) = self.server.start(&self.config.server_args()) {
+                self.server_error.push(LogLine { level: Level::Error, text: format!("Could not start sharing: {}", e) });
             }
+            // Show the new state on the next frame rather than after the polling interval.
+            self.server_polled -= std::time::Duration::from_secs(1);
         }
         error_box(ui, &self.server_error);
 
-        ui.add_space(4.0);
         paired_card(
             ui,
             "Computers allowed to connect",
-            "None yet. A computer is added here after it enters a pairing code.",
+            "None yet. A computer appears here once it has paired with this one: add this computer on it, and enter the code shown here.",
             "Removing one disconnects it and makes it pair again.",
             &mut self.paired_clients,
             &mut self.confirm_forget,
         );
 
-        ui.add_enabled_ui(!running, |ui| {
-            card(ui, |ui| {
-                section(ui, "Picture");
-                row(ui, "Bitrate", |ui| {
-                    ui.add(egui::Slider::new(&mut self.config.bitrate_mbps, 10..=2000).logarithmic(true).suffix(" Mbps"));
-                });
-                row(ui, "Frame rate", |ui| {
-                    segmented(ui, &mut self.config.fps, &[(30, "30"), (60, "60"), (90, "90"), (120, "120"), (144, "144")]);
-                });
-                row(ui, "Resolution", |ui| {
-                    segmented(ui, &mut self.config.scale, &[(1, "Native"), (2, "1/2"), (3, "1/3"), (4, "1/4")]);
-                });
-                row(ui, "Colour", |ui| {
-                    segmented(ui, &mut self.config.chroma_444, &[(true, "4:4:4 sharp text"), (false, "4:2:0 less data")]);
-                });
-            });
-
-            ui.add_space(4.0);
-            card(ui, |ui| {
-                section(ui, "Sharing");
-                ui.checkbox(&mut self.config.share_audio, "Share this computer's sound");
-                ui.checkbox(&mut self.config.allow_control, "Allow mouse and keyboard control");
-                ui.checkbox(&mut self.config.require_pairing, "Require pairing for new computers");
-                egui::CollapsingHeader::new(RichText::new("Network").color(MUTED)).show(ui, |ui| {
-                    row(ui, "Port", |ui| {
-                        ui.add(egui::DragValue::new(&mut self.config.port).range(1024..=65535).speed(1));
-                    });
-                    row(ui, "Packet size", |ui| {
-                        segmented(ui, &mut self.config.mtu, &[(1400, "1400 standard"), (8900, "8900 jumbo")]);
-                    });
-                    row(ui, "Pacing", |ui| {
-                        ui.add(egui::Slider::new(&mut self.config.pace_factor, 1.1..=4.0).suffix("x bitrate"))
-                            .on_hover_text("How fast packets leave. Lower is smoother for Wi-Fi, higher has less delay.");
-                    });
-                });
-            });
+        // What will be (or is being) shared, with the way to change it.
+        ui.add_space(4.0);
+        card(ui, |ui| {
+            section(ui, "Sharing with these settings");
+            let c = &self.config;
+            let resolution = if c.scale == 1 { "native resolution".to_owned() } else { format!("1/{} resolution", c.scale) };
+            ui.label(format!("{} Mbps, {} fps, {}, {}", c.bitrate_mbps, c.fps, resolution, if c.chroma_444 { "4:4:4" } else { "4:2:0" }));
+            let mut extras = Vec::new();
+            extras.push(if c.share_audio { "sound on" } else { "sound off" });
+            extras.push(if c.allow_control { "remote control allowed" } else { "view only" });
+            extras.push(if c.require_pairing { "pairing required" } else { "no pairing" });
+            ui.label(RichText::new(extras.join(", ")).color(MUTED));
+            if ui.link("Change in Settings").clicked() {
+                self.config.tab = Tab::Settings;
+                self.config.settings_page = SettingsPage::Sharing;
+            }
         });
-        if running {
-            ui.label(RichText::new("Settings are locked while sharing is on. Stop sharing to change them.").color(MUTED).small());
-        }
 
         if running && !log.is_empty() {
             ui.add_space(4.0);
@@ -655,6 +977,8 @@ enum ButtonKind {
     Primary,
     /// Ends something that is running: outlined in red.
     Stop,
+    /// Opens something rather than doing it: outlined in the accent colour.
+    Secondary,
 }
 
 /// A full-width action button with centred text.
@@ -671,6 +995,11 @@ fn action_button(ui: &mut egui::Ui, label: &str, kind: ButtonKind) -> egui::Resp
         (ButtonKind::Primary, true) => {
             ui.painter().rect_filled(rect, radius, if hovered { ACCENT_HOVER } else { ACCENT });
             Color32::BLACK
+        }
+        (ButtonKind::Secondary, true) => {
+            ui.painter().rect_filled(rect, radius, if hovered { FIELD_HOVER } else { FIELD });
+            ui.painter().rect_stroke(rect, radius, Stroke::new(1.5, ACCENT.gamma_multiply(if hovered { 1.0 } else { 0.7 })), egui::StrokeKind::Inside);
+            TEXT
         }
         (ButtonKind::Stop, true) => {
             ui.painter().rect_filled(rect, radius, RED.gamma_multiply(if hovered { 0.3 } else { 0.12 }));
@@ -713,28 +1042,30 @@ fn state_panel<R>(ui: &mut egui::Ui, color: Color32, title: &str, detail: &str, 
     shown.inner
 }
 
-/// Navigation tabs: plain text with an underline for the current one, each with a dot that
-/// lights up while that side is active. Nothing here looks like a button.
-fn tab_bar(ui: &mut egui::Ui, current: &mut Tab, tabs: &[(Tab, &str, Option<Color32>)]) {
+/// Navigation: plain text with an underline for the current entry, each optionally with a dot
+/// that lights up while something there is active. Nothing here looks like a button. Used for
+/// the main tabs and, smaller, for the pages of Settings.
+fn tab_bar<T: PartialEq + Copy>(ui: &mut egui::Ui, current: &mut T, tabs: &[(T, &str, Option<Color32>)], font_size: f32, height: f32) {
     let width = ui.available_width() / tabs.len() as f32;
-    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), 40.0), egui::Sense::hover());
+    let (bar, _) = ui.allocate_exact_size(Vec2::new(ui.available_width(), height), egui::Sense::hover());
     ui.painter().hline(bar.x_range(), bar.bottom() - 0.5, Stroke::new(1.0, BORDER));
 
     for (i, (tab, label, active)) in tabs.iter().enumerate() {
         let rect = egui::Rect::from_min_size(egui::pos2(bar.left() + width * i as f32, bar.top()), Vec2::new(width, bar.height()));
-        let response = ui.interact(rect, ui.id().with(("tab", i)), egui::Sense::click());
+        let response = ui.interact(rect, ui.id().with(("tab", *label)), egui::Sense::click());
         if response.clicked() {
             *current = *tab;
         }
         let selected = *current == *tab;
         let color = if selected || response.hovered() { TEXT } else { MUTED };
-        let font = egui::FontId::proportional(15.0);
+        let font = egui::FontId::proportional(font_size);
         let text = ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, label, font, color);
         if let Some(dot) = active {
             ui.painter().circle_filled(egui::pos2(text.right() + 10.0, rect.center().y), 4.0, *dot);
         }
         if selected {
-            let underline = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - 3.0), rect.right_bottom());
+            let thickness = if height > 34.0 { 3.0 } else { 2.0 };
+            let underline = egui::Rect::from_min_max(egui::pos2(rect.left(), rect.bottom() - thickness), rect.right_bottom());
             ui.painter().rect_filled(underline, CornerRadius::same(2), ACCENT);
         }
         if response.hovered() {
@@ -776,6 +1107,20 @@ fn error_box(ui: &mut egui::Ui, lines: &[LogLine]) {
         });
 }
 
+impl Drop for App {
+    fn drop(&mut self) {
+        if self.demo.is_some() || self.screenshot.is_some() {
+            return;
+        }
+        // With the tray agent running, sharing carries on and stays visible there. Without it,
+        // nothing would show that this computer is being shared, so it stops with the window.
+        if !self.agent.is_running() {
+            self.server.stop();
+        }
+        self.window.release();
+    }
+}
+
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
@@ -793,7 +1138,7 @@ impl eframe::App for App {
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
         }
         self.was_pairing = pairing;
-        let sharing = self.server.is_some() || self.demo.is_some();
+        let sharing = self.server_running || self.demo.is_some();
         let connected = self.client.as_ref().is_some_and(|c| client_state(&c.log()) == ClientState::Connected);
 
         egui::Panel::top("header").frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 0 })).show(ui, |ui| {
@@ -807,10 +1152,26 @@ impl eframe::App for App {
                 ui,
                 &mut self.config.tab,
                 &[
-                    (Tab::Connect, "Control another computer", connected.then_some(GREEN)),
-                    (Tab::Host, "Share this computer", sharing.then_some(share_color)),
+                    (Tab::Connect, "Connect", connected.then_some(GREEN)),
+                    (Tab::Host, "Share", sharing.then_some(share_color)),
+                    (Tab::Settings, "Settings", None),
                 ],
+                15.0,
+                40.0,
             );
+            if self.config.tab == Tab::Settings {
+                tab_bar(
+                    ui,
+                    &mut self.config.settings_page,
+                    &[
+                        (SettingsPage::Sharing, "When sharing", None),
+                        (SettingsPage::Connecting, "When connecting", None),
+                        (SettingsPage::General, "General", None),
+                    ],
+                    13.0,
+                    32.0,
+                );
+            }
         });
 
         // Always visible, whichever tab is open: what is running right now.
@@ -818,7 +1179,7 @@ impl eframe::App for App {
             ui.horizontal(|ui| {
                 strip_item(ui, if sharing { share_color } else { MUTED }, &format!("This computer: {}", share_title.to_lowercase()));
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let text = if connected { format!("Remote session: {}", self.config.address.trim()) } else { "Remote session: none".into() };
+                    let text = if connected { format!("Remote session: {}", self.target.0) } else { "Remote session: none".into() };
                     // Right-to-left: the label goes in first, then its dot.
                     ui.label(RichText::new(text).color(if connected { TEXT } else { MUTED }));
                     let (dot, _) = ui.allocate_exact_size(Vec2::splat(10.0), egui::Sense::hover());
@@ -828,22 +1189,24 @@ impl eframe::App for App {
         });
 
         egui::CentralPanel::default().frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 14 })).show(ui, |ui| {
-            egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| match self.config.tab {
+            // Screenshot mode can ask for the bottom of the page ("host-bottom").
+            let bottom = self.scroll_to_bottom;
+            egui::ScrollArea::vertical().auto_shrink([false, false]).stick_to_bottom(bottom).show(ui, |ui| match self.config.tab {
                 Tab::Connect => self.connect_tab(ui),
                 Tab::Host => self.host_tab(ui),
+                Tab::Settings => self.settings_tab(ui),
             });
         });
+
+        self.add_dialog(ui.ctx());
 
         if self.config != self.saved {
             self.config.save();
             self.saved = self.config.clone();
         }
 
-        // While something is running, poll for it ending (and for new pairings) even if it
-        // logs nothing.
-        if self.server.is_some() || self.client.is_some() {
-            ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
-        }
+        // The server and the tray agent change things behind our back; keep looking.
+        ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
 
         if let Some(path) = &self.screenshot {
             self.frames += 1;

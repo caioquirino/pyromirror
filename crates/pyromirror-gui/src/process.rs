@@ -2,7 +2,6 @@
 
 use std::collections::VecDeque;
 use std::io::{BufRead, BufReader, Write};
-use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -47,20 +46,10 @@ pub struct Process {
     log: Arc<Mutex<VecDeque<LogLine>>>,
 }
 
-fn sibling(name: &str) -> PathBuf {
-    let file = format!("{}{}", name, std::env::consts::EXE_SUFFIX);
-    std::env::current_exe()
-        .ok()
-        .and_then(|exe| exe.parent().map(|dir| dir.join(&file)))
-        .filter(|path| path.exists())
-        // Fall back to PATH.
-        .unwrap_or_else(|| PathBuf::from(file))
-}
-
 impl Process {
     /// Starts the program `name` that lives next to this executable.
     pub fn spawn(name: &str, args: &[String], ctx: &egui::Context) -> std::io::Result<Self> {
-        let mut command = Command::new(sibling(name));
+        let mut command = Command::new(crate::daemon::sibling(name));
         // stdin stays open: the client reads a pairing code from it when the host asks for one.
         command.args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
         #[cfg(windows)]

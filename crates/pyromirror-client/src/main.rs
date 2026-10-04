@@ -48,6 +48,10 @@ struct Args {
     #[arg(short, long)]
     fullscreen: bool,
 
+    /// Only pair with the host (asking for its code if needed), then exit without opening a window
+    #[arg(long)]
+    pair_only: bool,
+
     /// Keep the mouse pointer inside the viewer window (toggle with Ctrl+Alt+L)
     #[arg(long)]
     lock_mouse: bool,
@@ -136,7 +140,7 @@ fn main() -> anyhow::Result<()> {
 
     // A host that does not know this computer shows a one-time code, which the person types
     // here: on the terminal, or into the launcher, which passes it on through our stdin.
-    let paired_now = auth::connect(&mut tcp, client_id, &auth::device_name(), &mut hosts, |prompt| {
+    let host = auth::connect(&mut tcp, client_id, &auth::device_name(), &mut hosts, |prompt| {
         if prompt.wrong_attempts > 0 {
             warn!("Wrong pairing code, try again");
         } else if prompt.pairing_revoked {
@@ -152,8 +156,13 @@ fn main() -> anyhow::Result<()> {
         }
     })
     .context("could not pair with the host")?;
-    if paired_now {
+    if host.newly_paired {
         info!("Paired with this host; no code will be needed next time");
+    }
+    // The launcher reads this line to remember the computer.
+    info!("Host: {} {}", auth::to_hex(&host.server_id), host.server_name);
+    if args.pair_only {
+        return Ok(());
     }
 
     let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];

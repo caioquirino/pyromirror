@@ -141,7 +141,7 @@ cargo build --release
 The first build clones the Granite revision PyroWave is pinned to (into `submodules/pyrowave/Granite`, so it needs `git` and network access) and compiles PyroWave with CMake. `libpyrowave-shared` is copied next to the binaries; keep it there when moving them elsewhere.
 
 Binaries will be placed in `target/release/`:
-* `pyromirror`: The launcher window. Pick **Connect** or **Share**, adjust the settings, press the button; it starts the two programs below for you and remembers your settings.
+* `pyromirror`: The launcher window. **Connect** and **Share** each show one state and one button; everything adjustable lives under **Settings**, grouped by what it applies to: **When sharing** (picture, sound and control, pairing requirement, network), **When connecting** (the viewer window) and **General** (startup). The lists of computers live on the Connect and Share tabs. It starts the two programs below for you and remembers your settings.
 * `pyromirror-server`: The streaming host (screen capture, encoder).
 * `pyromirror-client`: The viewer (SDL3 window, decoder, input capture).
 
@@ -201,7 +201,16 @@ The Linux packages need PipeWire, a Vulkan driver and, on the host, `xdg-desktop
 
 ## Running PyroMirror
 
-The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) on both computers, press **Share this computer** on the host, and enter the address it shows in the **Connect** tab on the other one. It looks and works the same on Windows and Linux. The command-line programs it drives are described below.
+The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) on both computers and press **Start sharing** on the host. On the other one, open the **Connect** tab, choose **Add a computer**, enter the address the host shows and then the pairing code that appears on it. The computer is saved in the list, and from then on connecting is one click. It looks and works the same on Windows and Linux. The command-line programs it drives are described below.
+
+#### Running in the background
+
+In **Settings → General**:
+
+* **Start PyroMirror in the tray when I log in** adds a login entry (the `Run` registry key on Windows, an XDG autostart file on Linux) and puts an icon in the tray. The icon's dot shows whether sharing is off, on, or in use, and its menu can start or stop sharing, open the window, or quit. With the icon running, closing the window no longer stops sharing.
+* **Start sharing automatically at login** makes the computer reachable without anyone at the desk. Switching it on first runs a permission check (`pyromirror-server --check-permissions`): it starts screen capture so your desktop asks for consent now, verifies the consent is remembered, and on Windows waits for the firewall to allow incoming connections. The setting only turns on if the check passes.
+
+GNOME shows tray icons only with the AppIndicator extension; without it everything else still works and the window is opened from the application menu. Nothing runs before you log in, and on Windows the picture pauses on the lock screen and on UAC prompts.
 
 While connected, move the pointer to the top edge of the viewer for a toolbar with fullscreen, keyboard grab, mouse lock, mute, disconnect and live frame rate / bitrate.
 
@@ -225,6 +234,7 @@ cargo run --release --bin pyromirror-server -- \
 * `--scale <N>`: Shrink the picture by an integer factor before encoding (default: `1`; `2` turns a 4K desktop into a 1080p stream).
 * `--pace-factor <X>`: Release datagrams at X times the bitrate (default: `2`). Lower values, down to `1.1`, smooth out bursts on Wi-Fi at the cost of a few milliseconds of latency.
 * `--no-pairing`: Let anyone who can reach the port connect (see Pairing below).
+* `--check-permissions`: Check that sharing could start unattended, asking for any permission now, then exit.
 * `--no-audio`: Do not capture or send audio.
 * `--no-input`: Ignore the client's mouse and keyboard (view-only).
 * `--monitor <INDEX>`: Windows only, monitor to capture (default: primary). On Linux the portal dialog picks the monitor.
@@ -243,12 +253,12 @@ On Windows, allow the server through the firewall when prompted (TCP and UDP on 
 A computer has to be paired with the host once before it can connect:
 
 1. The first time it connects, the host shows a one-time 6-digit code (in the launcher's Share tab, or in the server's log line `Pairing request from <name>: code <code>`).
-2. The connecting computer asks for that code: the launcher shows a prompt, and `pyromirror-client` on a terminal reads it from standard input. Three wrong attempts end the request.
+2. The connecting computer asks for that code: the launcher's **Add a computer** dialog shows a prompt, and `pyromirror-client` on a terminal reads it from standard input (`--pair-only` pairs and exits without opening the viewer). Three wrong attempts end the request.
 3. After that the two machines remember each other and connect without a code, even if addresses change.
 
 The code exists only while a request is pending and is never reused.
 
-The launcher lists the paired computers on both tabs, each with a **Remove** link. Removing a computer on the host disconnects it if it is connected; the next time it tries, it is told that its pairing is no longer valid and is asked for a new code. The lists live in `%APPDATA%\pyromirror` / `~/.config/pyromirror` (`paired-clients` on the host, `paired-hosts` on the viewer), one computer per line, and can also be edited by hand. `--no-pairing` on the server lets anyone connect.
+The launcher lists the paired computers where they are used: computers you can control on the **Connect** tab, computers allowed to connect on the **Share** tab, each with a **Remove** link. Removing a computer on the host disconnects it if it is connected; the next time it tries, it is told that its pairing is no longer valid and is asked for a new code. The lists live in `%APPDATA%\pyromirror` / `~/.config/pyromirror` (`paired-clients` on the host, `paired-hosts` on the viewer), one computer per line, and can also be edited by hand. `--no-pairing` on the server lets anyone connect.
 
 Pairing keeps strangers from connecting. It does not encrypt anything: the stream and your keystrokes are still readable by others on the same network, and someone recording a pairing could work out the code. Pair on a network you trust.
 

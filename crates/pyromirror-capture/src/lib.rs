@@ -90,6 +90,7 @@ extern "C" {
 
 pub struct Capturer {
     ctx: *mut RawContext,
+    permission_remembered: bool,
     #[cfg(target_os = "linux")]
     _portal: portal::PortalSession,
 }
@@ -117,12 +118,16 @@ impl Capturer {
             pipewire_node: 0,
         };
 
+        // Windows needs no consent to capture; on Linux the portal decides.
+        #[cfg(not(target_os = "linux"))]
+        let permission_remembered = true;
+
         #[cfg(target_os = "linux")]
-        let portal_session = {
+        let (portal_session, permission_remembered) = {
             let stream = portal::open()?;
             config.pipewire_fd = stream.pipewire_fd;
             config.pipewire_node = stream.pipewire_node;
-            stream.session
+            (stream.session, stream.remembered)
         };
 
         let mut error = [0 as c_char; 512];
@@ -144,9 +149,16 @@ impl Capturer {
 
         Ok(Self {
             ctx,
+            permission_remembered,
             #[cfg(target_os = "linux")]
             _portal: portal_session,
         })
+    }
+
+    /// Whether capture will start next time without asking the person at the desk. False on
+    /// Linux desktops whose portal cannot remember the grant.
+    pub fn permission_remembered(&self) -> bool {
+        self.permission_remembered
     }
 
     /// Something to feed the client's mouse and keyboard into, if this desktop allows it.
