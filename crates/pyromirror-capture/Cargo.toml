@@ -18,6 +18,9 @@ wayland-protocols-misc = { version = "0.3", features = ["client"] }
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = ["Win32_UI_Input_KeyboardAndMouse", "Win32_UI_WindowsAndMessaging", "Win32_UI_HiDpi"] }
 
+[dev-dependencies]
+env_logger = { workspace = true }
+
 [build-dependencies]
 cc = "1.0"
 pkg-config = "0.3"

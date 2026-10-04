@@ -77,14 +77,37 @@ impl PacketPacer {
 /// `thread::sleep` rounds short sleeps up to 1-15 ms on Windows, which would throttle the stream
 /// far below the configured bitrate and frame rate.
 pub fn sleep_until(deadline: Instant) {
+    // How early the OS may be trusted to wake a sleeping thread. Windows rounds sleeps up to its
+    // timer tick, a millisecond or more. Linux wakes within some tens of microseconds, so nearly
+    // all of a wait can be slept there, which matters for the short waits between datagrams:
+    // spinning through those keeps a whole core busy.
+    #[cfg(windows)]
+    const MARGIN: Duration = Duration::from_millis(2);
+    #[cfg(not(windows))]
+    const MARGIN: Duration = Duration::from_micros(150);
+
     if let Some(wait) = deadline.checked_duration_since(Instant::now()) {
-        if wait > Duration::from_millis(3) {
-            std::thread::sleep(wait - Duration::from_millis(2));
+        if wait > MARGIN + MARGIN / 2 {
+            std::thread::sleep(wait - MARGIN);
         }
     }
     while Instant::now() < deadline {
         std::thread::yield_now();
     }
+}
+
+/// Waits out what the pacer asked for before the next datagram.
+///
+/// At streaming bitrates that is some tens of microseconds per datagram, which no timer delivers.
+/// Windows spins through it (see `sleep_until`). Elsewhere the thread sleeps a little longer than
+/// asked instead; the pacer makes up for it by letting the next few datagrams (a dozen kilobytes,
+/// well inside its burst allowance) go without a wait. That keeps the sending thread from
+/// occupying a whole core.
+fn pace_wait(wait: Duration) {
+    #[cfg(windows)]
+    sleep_until(Instant::now() + wait);
+    #[cfg(not(windows))]
+    std::thread::sleep(wait.max(Duration::from_micros(250)));
 }
 
 /// Creates a UDP socket with large kernel buffers for high-bitrate streaming.
@@ -167,7 +190,7 @@ impl FrameSender {
             self.packet_buf[PAYLOAD_HEADER_SIZE..datagram_len].copy_from_slice(packet);
 
             if let Some(wait) = self.pacer.pace(datagram_len) {
-                sleep_until(Instant::now() + wait);
+                pace_wait(wait);
             }
             self.socket.send_to(&self.packet_buf[..datagram_len], self.target_addr)?;
             total_sent += datagram_len;
