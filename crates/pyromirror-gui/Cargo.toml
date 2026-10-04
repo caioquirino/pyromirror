@@ -22,3 +22,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 
 [target.'cfg(target_os = "linux")'.dependencies]
 ksni = { version = "0.3", default-features = false, features = ["blocking", "async-io"] }
+
+[build-dependencies]
+winresource = "0.1"

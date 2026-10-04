@@ -15,6 +15,9 @@
     <MajorUpgrade DowngradeErrorMessage="A newer version of PyroMirror is already installed." />
     <Media Id="1" Cabinet="pyromirror.cab" EmbedCab="yes" />
 
+    <!-- Shown in "Installed apps"; the shortcut takes its icon from pyromirror.exe itself. -->
+    <Icon Id="pyromirror.ico" SourceFile="$(var.IconFile)" />
+    <Property Id="ARPPRODUCTICON" Value="pyromirror.ico" />
     <Property Id="ARPURLINFOABOUT" Value="https://github.com/caioquirino/pyromirror" />
 
     <Directory Id="TARGETDIR" Name="SourceDir">
@@ -24,7 +27,7 @@
             <File Id="LauncherExe" Name="pyromirror.exe" Source="$(var.SourceDir)/pyromirror.exe" KeyPath="yes">
               <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="PyroMirror"
                         Description="Remote desktop for local networks"
-                        WorkingDirectory="INSTALLDIR" Advertise="no" />
+                        WorkingDirectory="INSTALLDIR" Icon="pyromirror.ico" Advertise="no" />
             </File>
           </Component>
           <Component Id="Server" Guid="a1f4e0a2-64a7-4d3c-9d8e-0d2b5b6f9c22" Win64="yes">

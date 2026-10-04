@@ -15,5 +15,6 @@ OUTPUT="${3:-dist/pyromirror-$VERSION-windows-x86_64.msi}"
 MSI_VERSION="${VERSION%%[-+]*}"
 
 mkdir -p "$(dirname "$OUTPUT")"
-wixl -v -a x64 -D "Version=$MSI_VERSION" -D "SourceDir=$SOURCE" -o "$OUTPUT" packaging/windows/pyromirror.wxs
+wixl -v -a x64 -D "Version=$MSI_VERSION" -D "SourceDir=$SOURCE" \
+    -D "IconFile=crates/pyromirror-gui/assets/pyromirror.ico" -o "$OUTPUT" packaging/windows/pyromirror.wxs
 ls -lh "$OUTPUT"

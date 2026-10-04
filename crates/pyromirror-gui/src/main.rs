@@ -66,6 +66,7 @@ fn main() -> eframe::Result {
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("PyroMirror")
+            .with_icon(eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap_or_default())
             .with_app_id("pyromirror")
             .with_inner_size([460.0, 720.0])
             .with_min_inner_size([440.0, 520.0]),
