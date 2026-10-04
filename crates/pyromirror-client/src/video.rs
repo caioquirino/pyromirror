@@ -1,7 +1,7 @@
 //! UDP receive thread: decodes video, passes audio on.
 
 use std::net::UdpSocket;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -29,7 +29,13 @@ struct Stats {
     decode: Duration,
     /// Frames that never left the GPU.
     on_gpu: u32,
+    /// The largest video datagram that arrived, in bytes.
+    largest: usize,
 }
+
+/// Incomplete frames within one report (two seconds) without a single complete one, from which
+/// on the picture counts as not getting through. An idle desktop still sends four a second.
+const STALLED_FRAMES: u32 = 4;
 
 /// Feeds datagrams to the decoder and sends finished frames to the render thread.
 ///
@@ -45,6 +51,11 @@ pub fn receive_loop(
     recycled: Receiver<Vec<u8>>,
     audio: Option<Sender<Vec<i16>>>,
     summary: Arc<Mutex<String>>,
+    // Set to the size of the largest datagram that arrived when no frame could be put together
+    // for a while; the main thread passes that on to the server and resets it to 0.
+    stalled: Arc<AtomicU32>,
+    // Datagrams larger than this are dropped, to stand in for a network that does (testing).
+    largest_carried: usize,
     running: Arc<AtomicBool>,
 ) {
     let stride = width as usize * 4;
@@ -106,6 +117,7 @@ pub fn receive_loop(
 
     while running.load(Ordering::Relaxed) {
         match socket.recv_from(&mut datagram) {
+            Ok((len, _)) if len > largest_carried => {}
             Ok((len, _)) => {
                 // Anything that does not parse is not ours (or is corrupt); ignore it.
                 let packet = match parse_datagram(&datagram[..len]) {
@@ -124,6 +136,7 @@ pub fn receive_loop(
                     Err(_) => continue,
                 };
                 stats.bytes += len;
+                stats.largest = stats.largest.max(len);
 
                 match current_seq {
                     Some(seq) if packet.frame_seq == seq => {}
@@ -166,23 +179,35 @@ pub fn receive_loop(
 
         let elapsed = last_report.elapsed();
         if elapsed >= Duration::from_secs(2) {
+            // Datagrams arrive but never a whole frame's worth: most likely the big ones are
+            // being dropped on the way.
+            let is_stalled = stats.frames == 0 && stats.skipped >= STALLED_FRAMES;
+            if is_stalled {
+                stalled.store(stats.largest.max(1) as u32, Ordering::Relaxed);
+            }
             // Shown in the viewer's toolbar.
-            *summary.lock().unwrap() = format!(
-                "{:.0} fps {:.0} Mbps",
-                stats.frames as f64 / elapsed.as_secs_f64(),
-                stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64()
-            );
+            *summary.lock().unwrap() = if is_stalled {
+                "no picture: packets lost".to_owned()
+            } else {
+                format!(
+                    "{:.0} fps {:.0} Mbps pkt {}",
+                    stats.frames as f64 / elapsed.as_secs_f64(),
+                    stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
+                    stats.largest
+                )
+            };
             if stats.frames > 0 || stats.skipped > 0 {
                 let log_degraded = stats.partial > 0 || stats.skipped > 0;
                 let message = format!(
-                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode per frame ({}), {} partial, {} skipped, {} audio packets",
+                    "{:.1} fps, {:.1} Mbps, {:.2} ms decode per frame ({}), {} partial, {} skipped, {} audio packets, datagrams up to {} bytes",
                     stats.frames as f64 / elapsed.as_secs_f64(),
                     stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64(),
                     stats.decode.as_secs_f64() * 1000.0 / stats.frames.max(1) as f64,
                     if stats.on_gpu > 0 { "zero-copy" } else { "read back, converted on the CPU" },
                     stats.partial,
                     stats.skipped,
-                    stats.audio_packets
+                    stats.audio_packets,
+                    stats.largest
                 );
                 if log_degraded {
                     info!("{}", message);

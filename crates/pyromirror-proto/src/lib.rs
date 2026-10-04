@@ -26,6 +26,12 @@ pub const MSG_TYPE_SESSION_ACTION: u32 = 11;
 /// Client to server: what the session has switched on (one byte, `control::Toggles::to_bits`).
 pub const MSG_TYPE_SESSION_STATE: u32 = 12;
 
+/// Client to server: video is arriving, but no frame of it could be put together for a while.
+/// The payload is the size in bytes of the largest datagram that did arrive, as a little-endian
+/// `u32`. The usual cause is datagrams too big for the network in between (a jumbo-frame setting
+/// meeting Wi-Fi), so the server answers by making them smaller.
+pub const MSG_TYPE_DATAGRAMS_LOST: u32 = 13;
+
 /// [`CursorHeader::flags`]: the pointer is shown (not hidden by the remote desktop).
 pub const CURSOR_VISIBLE: u16 = 1 << 0;
 /// [`CursorHeader::flags`]: the pointer is drawn into the video, so the viewer should hide its

@@ -8,7 +8,7 @@ mod source;
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -25,7 +25,7 @@ use pyromirror_proto::control::{Listener, Side, Toggles};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent,
     CursorHeader, VideoCodecType, VideoColorProfile, CURSOR_IN_VIDEO, CURSOR_VISIBLE, MAX_CURSOR_SIDE,
-    MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS, MSG_TYPE_CURSOR, MSG_TYPE_INPUT_EVENT,
+    MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS, MSG_TYPE_CURSOR, MSG_TYPE_DATAGRAMS_LOST, MSG_TYPE_INPUT_EVENT,
     MSG_TYPE_SESSION_ACTION, MSG_TYPE_SESSION_STATE,
 };
 use source::{Source, SourceFrame, TestPattern};
@@ -127,6 +127,13 @@ fn parse_size(s: &str) -> Result<(u32, u32), String> {
         (Some(w), Some(h)) => Ok((w, h)),
         _ => Err("width and height must be between 16 and 16384".into()),
     }
+}
+
+/// The next datagram size to try when the viewer reports that nothing gets through whole:
+/// 1900 bytes passes most Wi-Fi (whose own frames may carry up to 2304), 1400 passes anything
+/// that carries ordinary Ethernet. `None` when there is nothing smaller left to try.
+fn smaller_datagrams(mtu: usize) -> Option<usize> {
+    [1900, 1400].into_iter().find(|&smaller| smaller < mtu)
 }
 
 /// Everything a streaming session needs; lives across client connections.
@@ -553,11 +560,15 @@ fn serve_client(
 
     let (stream_w, stream_h) = (params.width as f64, params.height as f64);
     let kick = tcp.try_clone()?;
-    let Pipeline { injector, audio, mtu, pace_mbps, pairing, .. } = pipeline;
+    let Pipeline { injector, audio, mtu, pace_mbps, pairing, source, encoder, imported_texture, max_frame_bytes, packet_boundary, frame_interval } = pipeline;
     let paired = &mut pairing.paired;
     // Only the channel and the flag cross into the audio thread; the capture itself stays put.
     let audio = audio.as_ref().map(|a| (&a.samples, &*a.wanted));
-    let (injector, mtu, pace_mbps) = (injector.as_ref(), *mtu, *pace_mbps);
+    let (injector, pace_mbps) = (injector.as_ref(), *pace_mbps);
+    // Audio datagrams are small either way; they follow the size the session starts with.
+    let audio_mtu = *mtu;
+    // How often the client has said that no frame arrives whole.
+    let datagrams_lost = &AtomicU32::new(0);
     let audio_socket = udp.try_clone()?;
     let (running, target) = (&running, &target);
     // What the client's session has switched on, once it has said so (older clients never do).
@@ -586,6 +597,11 @@ fn serve_client(
                         Err(e) => debug!("Undecodable input event: {}", e),
                     },
                     Ok((MSG_TYPE_SESSION_STATE, 1)) => client_toggles.store(payload[0], Ordering::Relaxed),
+                    Ok((MSG_TYPE_DATAGRAMS_LOST, 4)) => {
+                        let largest = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                        debug!("The client gets no whole frame; the largest datagram it received had {} bytes", largest);
+                        datagrams_lost.fetch_add(1, Ordering::Relaxed);
+                    }
                     Ok((other, _)) => debug!("Ignoring control message type {}", other),
                     Err(_) => break,
                 }
@@ -600,7 +616,7 @@ fn serve_client(
         if let Some((samples, wanted)) = audio {
             scope.spawn(move || {
                 let mut sender =
-                    AudioSender::new(audio_socket, *target.lock().unwrap(), mtu, pyromirror_audio::CHANNELS as usize);
+                    AudioSender::new(audio_socket, *target.lock().unwrap(), audio_mtu, pyromirror_audio::CHANNELS as usize);
                 let start = Instant::now();
                 // Anything still queued belongs to the previous client.
                 while samples.try_recv().is_ok() {}
@@ -646,12 +662,14 @@ fn serve_client(
         });
 
         let result = stream_video(
-            &mut pipeline.source,
-            &mut pipeline.encoder,
-            &mut pipeline.imported_texture,
-            pipeline.max_frame_bytes,
-            pipeline.packet_boundary,
-            pipeline.frame_interval,
+            source,
+            encoder,
+            imported_texture,
+            *max_frame_bytes,
+            mtu,
+            packet_boundary,
+            datagrams_lost,
+            *frame_interval,
             send_socket,
             &tcp,
             target,
@@ -712,7 +730,11 @@ fn stream_video(
     encoder: &mut Encoder,
     imported_texture: &mut Option<u64>,
     max_frame_bytes: usize,
-    packet_boundary: usize,
+    // The datagram size and the packet size that follows from it. Both shrink, for as long as the
+    // server runs, when the client reports that datagrams this big do not reach it.
+    mtu: &mut usize,
+    packet_boundary_now: &mut usize,
+    datagrams_lost: &AtomicU32,
     frame_interval: Duration,
     socket: UdpSocket,
     mut control: &TcpStream,
@@ -736,8 +758,28 @@ fn stream_video(
 
     let mut next_frame_at = Instant::now();
 
+    // Time for the client to notice that a change helped before it is asked again.
+    let mut shrunk_at: Option<Instant> = None;
+
     while running.load(Ordering::Relaxed) {
         sender.set_target_addr(*target.lock().unwrap());
+
+        if datagrams_lost.swap(0, Ordering::Relaxed) > 0 && shrunk_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(3)) {
+            match smaller_datagrams(*mtu) {
+                Some(smaller) => {
+                    warn!(
+                        "Datagrams of {} bytes do not reach the client (a jumbo-frame setting on a network \
+                         that cannot carry them?); sending {} byte datagrams from now on",
+                        *mtu, smaller
+                    );
+                    *mtu = smaller;
+                    *packet_boundary_now = packet_boundary(smaller);
+                    shrunk_at = Some(Instant::now());
+                }
+                None => debug!("The client gets no whole frame, and {} byte datagrams are the smallest tried", *mtu),
+            }
+        }
+        let packet_boundary = *packet_boundary_now;
 
         let frame = source.next_frame(frame_interval)?;
         let encode_start = Instant::now();
@@ -853,5 +895,19 @@ impl Stats {
             self.reported = true;
         }
         *self = Stats { since: Some(Instant::now()), reported: self.reported, ..Default::default() };
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn datagrams_step_down_to_wifi_then_ethernet_size() {
+        assert_eq!(smaller_datagrams(8900), Some(1900));
+        assert_eq!(smaller_datagrams(1900), Some(1400));
+        assert_eq!(smaller_datagrams(1500), Some(1400));
+        assert_eq!(smaller_datagrams(1400), None);
+        assert_eq!(smaller_datagrams(1200), None);
     }
 }

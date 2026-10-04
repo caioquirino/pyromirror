@@ -33,7 +33,7 @@ use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::control::{self, Side, Toggles};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, CursorHeader, InputEvent, VideoCodecType,
-    MSG_TYPE_CURSOR, MSG_TYPE_SESSION_ACTION, MSG_TYPE_SESSION_STATE,
+    MSG_TYPE_CURSOR, MSG_TYPE_DATAGRAMS_LOST, MSG_TYPE_SESSION_ACTION, MSG_TYPE_SESSION_STATE,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
     MSG_TYPE_INPUT_EVENT,
 };
@@ -80,6 +80,11 @@ struct Args {
     /// Exit after this many seconds (for automated testing)
     #[arg(long, hide = true)]
     exit_after: Option<f64>,
+
+    /// Ignore datagrams larger than this many bytes, as a network that cannot carry them would
+    /// (for automated testing)
+    #[arg(long, hide = true)]
+    drop_datagrams_over: Option<usize>,
 
     /// Write what the window shows to this BMP file on exit (for automated testing)
     #[arg(long, hide = true)]
@@ -378,11 +383,13 @@ fn main() -> anyhow::Result<()> {
     let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
     let summary = Arc::new(Mutex::new(String::new()));
+    let stalled = Arc::new(std::sync::atomic::AtomicU32::new(0));
     let video_thread = {
-        let (udp, running, summary) = (udp.try_clone()?, running.clone(), summary.clone());
+        let (udp, running, summary, stalled) = (udp.try_clone()?, running.clone(), summary.clone(), stalled.clone());
+        let largest_carried = args.drop_datagrams_over.unwrap_or(usize::MAX);
         std::thread::Builder::new()
             .name("video".into())
-            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, summary, running))?
+            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, summary, stalled, largest_carried, running))?
     };
 
     {
@@ -466,6 +473,17 @@ fn main() -> anyhow::Result<()> {
 
         let dst = letterbox(canvas.window().size(), (width, height));
         // Window coordinates -> stream pixels.
+        // No frame gets through whole: ask the server for smaller datagrams. (An older server
+        // ignores this.)
+        let largest = stalled.swap(0, Ordering::Relaxed);
+        if largest != 0 {
+            warn!(
+                "Video arrives but no frame is complete (largest datagram received: {} bytes); the server's \
+                 datagram size is probably too big for this network. Asking it for smaller ones",
+                largest
+            );
+            let _ = write_message(&mut tcp, MSG_TYPE_DATAGRAMS_LOST, &largest.to_le_bytes());
+        }
         let to_stream = |x: f32, y: f32| {
             let sx = ((x - dst.x) / dst.w * width as f32).clamp(0.0, width as f32 - 1.0);
             let sy = ((y - dst.y) / dst.h * height as f32).clamp(0.0, height as f32 - 1.0);
