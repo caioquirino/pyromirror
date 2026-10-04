@@ -62,6 +62,37 @@ struct RawConfig {
     output_index: i32,
     pipewire_fd: i32,
     pipewire_node: u32,
+    cursor_metadata: bool,
+}
+
+#[repr(C)]
+struct RawCursor {
+    serial: u64,
+    in_video: bool,
+    visible: bool,
+    width: u32,
+    height: u32,
+    hot_x: u32,
+    hot_y: u32,
+    rgba: *const u8,
+}
+
+/// The desktop's mouse pointer, as the viewer needs it to draw the pointer itself.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Cursor {
+    /// Changes whenever anything else here changes.
+    pub serial: u64,
+    /// The pointer is drawn into the captured frames, so there is no shape to hand out.
+    pub in_video: bool,
+    /// False while the desktop hides the pointer (video players, games).
+    pub visible: bool,
+    /// Zero until a shape has been seen.
+    pub width: u32,
+    pub height: u32,
+    pub hot_x: u32,
+    pub hot_y: u32,
+    /// `width * height * 4` bytes, straight alpha.
+    pub rgba: Vec<u8>,
 }
 
 #[repr(C)]
@@ -83,6 +114,7 @@ extern "C" {
     fn pyromirror_capture_release(ctx: *mut RawContext);
     #[cfg_attr(not(windows), allow(dead_code))]
     fn pyromirror_capture_get_bounds(ctx: *mut RawContext, x: *mut i32, y: *mut i32, width: *mut u32, height: *mut u32) -> bool;
+    fn pyromirror_capture_get_cursor(ctx: *mut RawContext, out: *mut RawCursor);
     fn pyromirror_capture_hdr_active(ctx: *mut RawContext) -> bool;
     fn pyromirror_capture_last_error(ctx: *mut RawContext) -> *const c_char;
     fn pyromirror_capture_destroy(ctx: *mut RawContext);
@@ -116,6 +148,7 @@ impl Capturer {
             output_index: options.output.map_or(-1, |o| o as i32),
             pipewire_fd: -1,
             pipewire_node: 0,
+            cursor_metadata: false,
         };
 
         // Windows needs no consent to capture; on Linux the portal decides.
@@ -127,6 +160,7 @@ impl Capturer {
             let stream = portal::open()?;
             config.pipewire_fd = stream.pipewire_fd;
             config.pipewire_node = stream.pipewire_node;
+            config.cursor_metadata = stream.cursor_metadata;
             (stream.session, stream.remembered)
         };
 
@@ -153,6 +187,26 @@ impl Capturer {
             #[cfg(target_os = "linux")]
             _portal: portal_session,
         })
+    }
+
+    /// The pointer's current shape and visibility, if it differs from the one with serial
+    /// `known`. Pass `None` to get it unconditionally.
+    pub fn cursor(&mut self, known: Option<u64>) -> Option<Cursor> {
+        let mut raw = RawCursor { serial: 0, in_video: false, visible: true, width: 0, height: 0, hot_x: 0, hot_y: 0, rgba: std::ptr::null() };
+        unsafe { pyromirror_capture_get_cursor(self.ctx, &mut raw) };
+        if known == Some(raw.serial) {
+            return None;
+        }
+        let len = raw.width as usize * raw.height as usize * 4;
+        let rgba = if raw.rgba.is_null() || len == 0 {
+            Vec::new()
+        } else {
+            // SAFETY: the native side guarantees `rgba` covers width * height * 4 bytes until
+            // the next call into it, which needs `&mut self`.
+            unsafe { std::slice::from_raw_parts(raw.rgba, len) }.to_vec()
+        };
+        let (width, height) = if rgba.is_empty() { (0, 0) } else { (raw.width, raw.height) };
+        Some(Cursor { serial: raw.serial, in_video: raw.in_video, visible: raw.visible, width, height, hot_x: raw.hot_x, hot_y: raw.hot_y, rgba })
     }
 
     /// Whether capture will start next time without asking the person at the desk. False on

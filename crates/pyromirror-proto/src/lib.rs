@@ -16,6 +16,62 @@ pub const MSG_TYPE_CLIENT_HELLO: u32 = 1;
 pub const MSG_TYPE_CODEC_PARAMS: u32 = 7;
 pub const MSG_TYPE_INPUT_EVENT: u32 = 9;
 
+/// Server to client: the remote pointer's shape. The message payload is a [`CursorHeader`]; it is
+/// followed on the stream by `width * height * 4` bytes of straight-alpha RGBA.
+pub const MSG_TYPE_CURSOR: u32 = 10;
+
+/// [`CursorHeader::flags`]: the pointer is shown (not hidden by the remote desktop).
+pub const CURSOR_VISIBLE: u16 = 1 << 0;
+/// [`CursorHeader::flags`]: the pointer is drawn into the video, so the viewer should hide its
+/// own instead of showing a second one.
+pub const CURSOR_IN_VIDEO: u16 = 1 << 1;
+
+/// Largest pointer image sent; bigger ones are left out and the viewer keeps its own pointer.
+pub const MAX_CURSOR_SIDE: u16 = 256;
+
+/// How the remote pointer looks, so the viewer can draw it locally and without lag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CursorHeader {
+    /// Size of the image that follows; zero if no shape is known.
+    pub width: u16,
+    pub height: u16,
+    pub hot_x: u16,
+    pub hot_y: u16,
+    pub flags: u16,
+    /// How many desktop pixels one stream pixel covers (the server's `--scale`), which the
+    /// viewer needs to size the pointer like the rest of the picture.
+    pub scale: u16,
+}
+
+impl CursorHeader {
+    pub const SIZE: usize = 12;
+
+    /// Number of image bytes that follow the header.
+    pub fn image_len(&self) -> usize {
+        self.width as usize * self.height as usize * 4
+    }
+
+    pub fn serialize(&self) -> [u8; Self::SIZE] {
+        let mut buf = [0u8; Self::SIZE];
+        for (i, v) in [self.width, self.height, self.hot_x, self.hot_y, self.flags, self.scale].into_iter().enumerate() {
+            LittleEndian::write_u16(&mut buf[i * 2..i * 2 + 2], v);
+        }
+        buf
+    }
+
+    pub fn deserialize(buf: &[u8]) -> Result<Self, ProtoError> {
+        if buf.len() < Self::SIZE {
+            return Err(ProtoError::BufferTooSmall { required: Self::SIZE, provided: buf.len() });
+        }
+        let field = |i: usize| LittleEndian::read_u16(&buf[i * 2..i * 2 + 2]);
+        let header = Self { width: field(0), height: field(1), hot_x: field(2), hot_y: field(3), flags: field(4), scale: field(5) };
+        if header.width > MAX_CURSOR_SIDE || header.height > MAX_CURSOR_SIDE {
+            return Err(ProtoError::LengthMismatch { expected: MAX_CURSOR_SIDE as usize, actual: header.width.max(header.height) as usize });
+        }
+        Ok(header)
+    }
+}
+
 #[inline]
 pub const fn make_message_type(t: u32, size: u32) -> u32 {
     (((b'P' as u32) << 26)
@@ -71,6 +127,10 @@ pub fn read_message<R: std::io::Read>(
     r.read_exact(&mut payload[..len])?;
     Ok((message_get_type(magic), len))
 }
+
+/// [`ClientHello::flags`]: the client only wants to pair (or confirm that it is paired) and will
+/// not start a session.
+pub const HELLO_PAIR_ONLY: u16 = 1 << 0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientHello {
@@ -524,6 +584,16 @@ impl PayloadHeader {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cursor_header_roundtrips_and_rejects_oversized_images() {
+        let header = CursorHeader { width: 48, height: 32, hot_x: 5, hot_y: 7, flags: CURSOR_VISIBLE, scale: 2 };
+        assert_eq!(CursorHeader::deserialize(&header.serialize()).unwrap(), header);
+        assert_eq!(header.image_len(), 48 * 32 * 4);
+        let huge = CursorHeader { width: MAX_CURSOR_SIDE + 1, ..header };
+        assert!(CursorHeader::deserialize(&huge.serialize()).is_err());
+        assert!(CursorHeader::deserialize(&[0u8; 5]).is_err());
+    }
 
     #[test]
     fn test_codec_params_roundtrip() {

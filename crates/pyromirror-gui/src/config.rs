@@ -44,6 +44,9 @@ pub struct Config {
 
     // Connect
     pub computers: Vec<Computer>,
+    /// The computer the viewer was last pointed at, so a launcher opened while the viewer is
+    /// still running can say what it is connected to.
+    pub last_target: Computer,
     /// Superseded by `computers`; only read to carry old entries over.
     pub recent: Vec<String>,
     pub fullscreen: bool,
@@ -75,6 +78,7 @@ impl Default for Config {
             tab: Tab::Connect,
             settings_page: SettingsPage::Sharing,
             computers: Vec::new(),
+            last_target: Computer::default(),
             recent: Vec::new(),
             fullscreen: false,
             lock_mouse: false,

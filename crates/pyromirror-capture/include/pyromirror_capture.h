@@ -28,7 +28,22 @@ typedef struct pyromirror_capture_config {
     // node to consume.
     int32_t pipewire_fd;
     uint32_t pipewire_node;
+    // Linux: true if the portal delivers the pointer as stream metadata rather than drawing it
+    // into the frames.
+    bool cursor_metadata;
 } pyromirror_capture_config;
+
+// The desktop's mouse pointer, kept out of the picture so the viewer can draw it locally.
+typedef struct pyromirror_capture_cursor {
+    uint64_t serial;     // Changes whenever anything below changes; starts at 0 (nothing known).
+    bool in_video;       // The pointer is drawn into the frames; there is no shape to hand out.
+    bool visible;        // False while the desktop hides the pointer.
+    uint32_t width;      // Zero until a shape has been seen.
+    uint32_t height;
+    uint32_t hot_x;
+    uint32_t hot_y;
+    const uint8_t* rgba; // width * height * 4 bytes, straight alpha. Valid until the next call.
+} pyromirror_capture_cursor;
 
 typedef struct pyromirror_capture_frame {
     const uint8_t* data; // Valid until the next acquire/release/destroy call.
@@ -43,6 +58,8 @@ pyromirror_capture_context* pyromirror_capture_create(const pyromirror_capture_c
 // Releases any previously acquired frame, then waits up to timeout_ms for a new one.
 int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint32_t timeout_ms, pyromirror_capture_frame* out_frame);
 void pyromirror_capture_release(pyromirror_capture_context* ctx);
+// Current pointer shape and visibility. Cheap; call after each acquire.
+void pyromirror_capture_get_cursor(pyromirror_capture_context* ctx, pyromirror_capture_cursor* out);
 // Windows: position and size of the captured monitor in virtual-desktop pixels. Returns false
 // where that is not known (Linux).
 bool pyromirror_capture_get_bounds(pyromirror_capture_context* ctx, int32_t* x, int32_t* y, uint32_t* width, uint32_t* height);

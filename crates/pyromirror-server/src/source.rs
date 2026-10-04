@@ -42,6 +42,20 @@ impl Source {
         self
     }
 
+    /// The factor frames are shrunk by.
+    pub fn scale(&self) -> u32 {
+        self.scale
+    }
+
+    /// The desktop pointer, if it changed since the one with serial `known`.
+    pub fn cursor(&mut self, known: Option<u64>) -> Option<pyromirror_capture::Cursor> {
+        match &mut self.kind {
+            Kind::Capture(capturer) => capturer.cursor(known),
+            // The pattern has no pointer; the viewer keeps its own.
+            Kind::Pattern(_) => None,
+        }
+    }
+
     /// True once the capture backend has failed for good.
     pub fn is_lost(&self) -> bool {
         self.lost

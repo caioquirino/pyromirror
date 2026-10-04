@@ -73,6 +73,11 @@ impl Daemon {
         Self::new("pyromirror-server", "server")
     }
 
+    /// The remote desktop window (`pyromirror-client`).
+    pub fn viewer() -> Self {
+        Self::new("pyromirror-client", "viewer")
+    }
+
     /// The tray agent (`pyromirror --background`).
     pub fn agent() -> Self {
         Self::new("pyromirror", "agent")

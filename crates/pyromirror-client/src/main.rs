@@ -3,6 +3,7 @@
 //! Receives PyroWave packets over UDP, decodes them on the GPU and shows the result in an SDL3
 //! window. Mouse and keyboard events go back to the server over the TCP control connection.
 
+mod pointer;
 mod toolbar;
 mod video;
 
@@ -25,7 +26,8 @@ use pyromirror_codec::{Chroma, Decoder, Device};
 use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::{
-    read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent, VideoCodecType,
+    read_message, write_message, AudioCodecType, ClientHello, CodecParameters, CursorHeader, InputEvent, VideoCodecType,
+    MSG_TYPE_CURSOR,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
     MSG_TYPE_INPUT_EVENT,
 };
@@ -135,7 +137,8 @@ fn main() -> anyhow::Result<()> {
     tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
 
     let mut hello = [0u8; ClientHello::SIZE];
-    ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
+    let flags = if args.pair_only { pyromirror_proto::HELLO_PAIR_ONLY } else { 0 };
+    ClientHello { udp_port: local_udp_port, flags }.serialize(&mut hello)?;
     write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
 
     // A host that does not know this computer shows a one-time code, which the person types
@@ -275,12 +278,27 @@ fn main() -> anyhow::Result<()> {
         });
     }
 
+    let (cursor_tx, cursor_rx) = crossbeam_channel::unbounded::<(CursorHeader, Vec<u8>)>();
     {
-        // The server sends nothing after the handshake, so a read only returns when it goes away.
+        // After the handshake the server only sends the pointer's shape; a failed read means it
+        // went away.
         let (mut tcp, running) = (tcp.try_clone()?, running.clone());
         std::thread::spawn(move || {
-            let mut buf = [0u8; 64];
-            while matches!(tcp.read(&mut buf), Ok(n) if n > 0) {}
+            let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
+            loop {
+                match read_message(&mut tcp, &mut payload) {
+                    Ok((MSG_TYPE_CURSOR, len)) => {
+                        let Ok(header) = CursorHeader::deserialize(&payload[..len]) else { break };
+                        let mut image = vec![0u8; header.image_len()];
+                        if tcp.read_exact(&mut image).is_err() {
+                            break;
+                        }
+                        let _ = cursor_tx.send((header, image));
+                    }
+                    Ok(_) => {}
+                    Err(_) => break,
+                }
+            }
             if running.swap(false, Ordering::Relaxed) {
                 warn!("Server closed the connection");
             }
@@ -298,6 +316,7 @@ fn main() -> anyhow::Result<()> {
     let mut have_frame = false;
     let mut last_frame: Option<Vec<u8>> = None;
     let mut redraw = true;
+    let mut remote_pointer = pointer::Pointer::new();
     let mut muted = false;
     // Confines the pointer to the window so it cannot slip onto another monitor or the local
     // taskbar; takes effect while the window has focus.
@@ -470,6 +489,16 @@ fn main() -> anyhow::Result<()> {
 
         if toolbar.update(if relative_mouse { None } else { pointer }, window_width, &stats) {
             redraw = true;
+        }
+
+        // One pointer: the remote one's shape, drawn by this window. (Relative mode hides the
+        // pointer altogether, which SDL does by itself.)
+        for (header, image) in cursor_rx.try_iter() {
+            remote_pointer.set_shape(header, image);
+        }
+        if !relative_mouse {
+            let over_toolbar = pointer.is_some_and(|p| toolbar.captures(p, window_width, &stats));
+            remote_pointer.apply(&sdl.mouse(), dst.w / width as f32, over_toolbar);
         }
 
         if redraw {

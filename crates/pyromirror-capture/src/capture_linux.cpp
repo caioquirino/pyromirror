@@ -49,7 +49,73 @@ struct pyromirror_capture_context {
 
     // Owned by the caller between acquire calls.
     std::vector<uint8_t> front;
+
+    // The pointer. With cursor_metadata the compositor reports it on the side (guarded by
+    // `mutex`); otherwise it is drawn into the frames and there is nothing to track.
+    bool cursor_metadata = false;
+    uint64_t cursor_serial = 0;
+    bool cursor_visible = true;
+    uint32_t cursor_width = 0, cursor_height = 0, cursor_hot_x = 0, cursor_hot_y = 0;
+    std::vector<uint8_t> cursor_rgba;
+    // Copy handed to the caller, so the PipeWire thread can keep updating the original.
+    std::vector<uint8_t> cursor_out;
 };
+
+#define CURSOR_META_SIZE(w, h) (sizeof(struct spa_meta_cursor) + sizeof(struct spa_meta_bitmap) + (w) * (h) * 4)
+
+// Reads pointer metadata attached to a buffer. Called on the PipeWire thread.
+static void update_cursor(pyromirror_capture_context* ctx, struct spa_buffer* buf) {
+    auto* cursor = static_cast<struct spa_meta_cursor*>(spa_buffer_find_meta_data(buf, SPA_META_Cursor, sizeof(struct spa_meta_cursor)));
+    // An id of 0 means "nothing new about the pointer in this buffer".
+    if (!cursor || !spa_meta_cursor_is_valid(cursor)) return;
+    // No bitmap attached: only the position changed, which the viewer does not need.
+    if (cursor->bitmap_offset < sizeof(struct spa_meta_cursor)) return;
+
+    auto* bitmap = SPA_PTROFF(cursor, cursor->bitmap_offset, struct spa_meta_bitmap);
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+
+    uint32_t w = bitmap->size.width, h = bitmap->size.height;
+    bool has_image = spa_meta_bitmap_is_valid(bitmap) && bitmap->offset >= sizeof(struct spa_meta_bitmap) && w > 0 && h > 0;
+    if (!has_image) {
+        // A bitmap without image data is how compositors say the pointer is hidden.
+        if (ctx->cursor_visible) {
+            ctx->cursor_visible = false;
+            ctx->cursor_serial++;
+        }
+        return;
+    }
+    if (w > 512 || h > 512) return;
+
+    bool bgr;
+    switch (bitmap->format) {
+    case SPA_VIDEO_FORMAT_BGRA: case SPA_VIDEO_FORMAT_BGRx: bgr = true; break;
+    case SPA_VIDEO_FORMAT_RGBA: case SPA_VIDEO_FORMAT_RGBx: bgr = false; break;
+    default: return;
+    }
+
+    const uint8_t* src = SPA_PTROFF(bitmap, bitmap->offset, uint8_t);
+    uint32_t stride = bitmap->stride > 0 ? static_cast<uint32_t>(bitmap->stride) : w * 4;
+    ctx->cursor_rgba.resize(static_cast<size_t>(w) * h * 4);
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            const uint8_t* in = src + static_cast<size_t>(y) * stride + x * 4;
+            uint8_t* out = &ctx->cursor_rgba[(static_cast<size_t>(y) * w + x) * 4];
+            uint32_t a = in[3];
+            uint32_t r = bgr ? in[2] : in[0], g = in[1], b = bgr ? in[0] : in[2];
+            // Compositors hand out premultiplied alpha; the viewer wants straight alpha.
+            if (a > 0 && a < 255) {
+                r = r * 255 / a; g = g * 255 / a; b = b * 255 / a;
+            }
+            out[0] = r > 255 ? 255 : r; out[1] = g > 255 ? 255 : g; out[2] = b > 255 ? 255 : b; out[3] = a;
+        }
+    }
+    ctx->cursor_width = w;
+    ctx->cursor_height = h;
+    ctx->cursor_hot_x = cursor->hotspot.x > 0 ? static_cast<uint32_t>(cursor->hotspot.x) : 0;
+    ctx->cursor_hot_y = cursor->hotspot.y > 0 ? static_cast<uint32_t>(cursor->hotspot.y) : 0;
+    ctx->cursor_visible = true;
+    ctx->cursor_serial++;
+}
 
 static void fail(pyromirror_capture_context* ctx, const std::string& message) {
     std::lock_guard<std::mutex> lock(ctx->mutex);
@@ -99,11 +165,16 @@ static void on_param_changed(void* data, uint32_t id, const struct spa_pod* para
     // which are not generally mappable.
     uint8_t buffer[512];
     struct spa_pod_builder b = SPA_POD_BUILDER_INIT(buffer, sizeof(buffer));
-    const struct spa_pod* params[1];
+    const struct spa_pod* params[2];
     params[0] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
         SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
         SPA_PARAM_BUFFERS_dataType, SPA_POD_CHOICE_FLAGS_Int((1 << SPA_DATA_MemPtr) | (1 << SPA_DATA_MemFd))));
-    pw_stream_update_params(ctx->stream, params, 1);
+    // Room for the pointer's picture next to each frame.
+    params[1] = static_cast<const struct spa_pod*>(spa_pod_builder_add_object(&b,
+        SPA_TYPE_OBJECT_ParamMeta, SPA_PARAM_Meta,
+        SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Cursor),
+        SPA_PARAM_META_size, SPA_POD_CHOICE_RANGE_Int(CURSOR_META_SIZE(64, 64), CURSOR_META_SIZE(1, 1), CURSOR_META_SIZE(256, 256))));
+    pw_stream_update_params(ctx->stream, params, ctx->cursor_metadata ? 2 : 1);
 }
 
 static void on_process(void* data) {
@@ -118,6 +189,8 @@ static void on_process(void* data) {
     if (!newest) return;
 
     struct spa_buffer* buf = newest->buffer;
+    // Pointer changes arrive in buffers of their own, which may carry no picture.
+    if (ctx->cursor_metadata) update_cursor(ctx, buf);
     const struct spa_meta_header* header = static_cast<const struct spa_meta_header*>(
         spa_buffer_find_meta_data(buf, SPA_META_Header, sizeof(struct spa_meta_header)));
     bool corrupted = header && (header->flags & SPA_META_HEADER_FLAG_CORRUPTED);
@@ -190,6 +263,7 @@ extern "C" pyromirror_capture_context* pyromirror_capture_create(const pyromirro
     pw_init(nullptr, nullptr);
 
     auto* ctx = new pyromirror_capture_context();
+    ctx->cursor_metadata = config->cursor_metadata;
     int fd = config->pipewire_fd;
 
     ctx->loop = pw_thread_loop_new("pyromirror-pw", nullptr);
@@ -266,6 +340,20 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
 }
 
 extern "C" void pyromirror_capture_release(pyromirror_capture_context*) {
+}
+
+extern "C" void pyromirror_capture_get_cursor(pyromirror_capture_context* ctx, pyromirror_capture_cursor* out) {
+    if (!ctx || !out) return;
+    std::lock_guard<std::mutex> lock(ctx->mutex);
+    ctx->cursor_out = ctx->cursor_rgba;
+    out->serial = ctx->cursor_serial;
+    out->in_video = !ctx->cursor_metadata;
+    out->visible = ctx->cursor_visible;
+    out->width = ctx->cursor_width;
+    out->height = ctx->cursor_height;
+    out->hot_x = ctx->cursor_hot_x;
+    out->hot_y = ctx->cursor_hot_y;
+    out->rgba = ctx->cursor_out.data();
 }
 
 extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context*, int32_t*, int32_t*, uint32_t*, uint32_t*) {

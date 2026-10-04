@@ -12,6 +12,7 @@
 #include <wrl/client.h>
 #include <stdio.h>
 #include <string>
+#include <vector>
 #include "../include/pyromirror_capture.h"
 
 using Microsoft::WRL::ComPtr;
@@ -25,7 +26,98 @@ struct pyromirror_capture_context {
     D3D11_TEXTURE2D_DESC staging_desc = {};
     bool mapped = false;
     std::string last_error;
+
+    // Desktop Duplication never draws the pointer into the image; it reports it on the side.
+    uint64_t cursor_serial = 0;
+    bool cursor_visible = true;
+    uint32_t cursor_width = 0, cursor_height = 0, cursor_hot_x = 0, cursor_hot_y = 0;
+    std::vector<uint8_t> cursor_rgba;
+    std::vector<uint8_t> cursor_raw;
 };
+
+// Converts the pointer shape Windows reports into straight-alpha RGBA.
+static void convert_cursor(pyromirror_capture_context* ctx, const DXGI_OUTDUPL_POINTER_SHAPE_INFO& info) {
+    const uint8_t* src = ctx->cursor_raw.data();
+    uint32_t w = info.Width;
+    uint32_t h = info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME ? info.Height / 2 : info.Height;
+    if (w == 0 || h == 0 || w > 512 || h > 512) return;
+
+    std::vector<uint8_t> rgba(static_cast<size_t>(w) * h * 4, 0);
+    // Pixels that Windows would invert against what is under them. There is no "invert" on the
+    // viewer's side, so they become black with a white outline, which shows on any background
+    // (this is what makes the text I-beam visible).
+    std::vector<bool> inverted(static_cast<size_t>(w) * h, false);
+
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            uint8_t* out = &rgba[(static_cast<size_t>(y) * w + x) * 4];
+            if (info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_MONOCHROME) {
+                // 1 bit per pixel: an AND mask followed by an XOR mask.
+                uint8_t bit = 0x80 >> (x % 8);
+                bool and_bit = src[y * info.Pitch + x / 8] & bit;
+                bool xor_bit = src[(y + h) * info.Pitch + x / 8] & bit;
+                if (!and_bit) {
+                    out[0] = out[1] = out[2] = xor_bit ? 255 : 0;
+                    out[3] = 255;
+                } else if (xor_bit) {
+                    inverted[static_cast<size_t>(y) * w + x] = true;
+                }
+            } else {
+                const uint8_t* in = src + y * info.Pitch + x * 4; // B, G, R, A
+                if (info.Type == DXGI_OUTDUPL_POINTER_SHAPE_TYPE_COLOR) {
+                    out[0] = in[2]; out[1] = in[1]; out[2] = in[0]; out[3] = in[3];
+                } else if (in[3] == 0) { // masked colour: opaque pixel
+                    out[0] = in[2]; out[1] = in[1]; out[2] = in[0]; out[3] = 255;
+                } else if (in[0] || in[1] || in[2]) { // masked colour: XOR with the screen
+                    inverted[static_cast<size_t>(y) * w + x] = true;
+                }
+            }
+        }
+    }
+
+    for (uint32_t y = 0; y < h; ++y) {
+        for (uint32_t x = 0; x < w; ++x) {
+            size_t i = static_cast<size_t>(y) * w + x;
+            if (inverted[i]) {
+                rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 0;
+                rgba[i * 4 + 3] = 255;
+            } else if (rgba[i * 4 + 3] == 0) {
+                bool next_to_inverted = (x > 0 && inverted[i - 1]) || (x + 1 < w && inverted[i + 1]) ||
+                                        (y > 0 && inverted[i - w]) || (y + 1 < h && inverted[i + w]);
+                if (next_to_inverted) {
+                    rgba[i * 4 + 0] = rgba[i * 4 + 1] = rgba[i * 4 + 2] = 255;
+                    rgba[i * 4 + 3] = 255;
+                }
+            }
+        }
+    }
+
+    ctx->cursor_rgba.swap(rgba);
+    ctx->cursor_width = w;
+    ctx->cursor_height = h;
+    ctx->cursor_hot_x = info.HotSpot.x > 0 ? static_cast<uint32_t>(info.HotSpot.x) : 0;
+    ctx->cursor_hot_y = info.HotSpot.y > 0 ? static_cast<uint32_t>(info.HotSpot.y) : 0;
+    ctx->cursor_serial++;
+}
+
+// Picks up pointer changes that came with a duplication frame.
+static void update_cursor(pyromirror_capture_context* ctx, const DXGI_OUTDUPL_FRAME_INFO& info) {
+    if (info.LastMouseUpdateTime.QuadPart != 0) {
+        bool visible = info.PointerPosition.Visible != 0;
+        if (visible != ctx->cursor_visible) {
+            ctx->cursor_visible = visible;
+            ctx->cursor_serial++;
+        }
+    }
+    if (info.PointerShapeBufferSize > 0) {
+        ctx->cursor_raw.resize(info.PointerShapeBufferSize);
+        DXGI_OUTDUPL_POINTER_SHAPE_INFO shape = {};
+        UINT needed = 0;
+        if (SUCCEEDED(ctx->duplication->GetFramePointerShape(info.PointerShapeBufferSize, ctx->cursor_raw.data(), &needed, &shape))) {
+            convert_cursor(ctx, shape);
+        }
+    }
+}
 
 static std::string hr_message(const char* what, HRESULT hr) {
     char buf[256];
@@ -174,6 +266,8 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
         return PYROMIRROR_CAPTURE_ERROR;
     }
 
+    update_cursor(ctx, info);
+
     // LastPresentTime == 0 means only the mouse pointer moved; the desktop image is unchanged.
     ComPtr<ID3D11Texture2D> tex;
     if (info.LastPresentTime.QuadPart == 0 || FAILED(resource.As(&tex))) {
@@ -226,6 +320,18 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
     out_frame->stride = mapped.RowPitch;
     out_frame->format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
     return PYROMIRROR_CAPTURE_FRAME;
+}
+
+extern "C" void pyromirror_capture_get_cursor(pyromirror_capture_context* ctx, pyromirror_capture_cursor* out) {
+    if (!ctx || !out) return;
+    out->serial = ctx->cursor_serial;
+    out->in_video = false;
+    out->visible = ctx->cursor_visible;
+    out->width = ctx->cursor_width;
+    out->height = ctx->cursor_height;
+    out->hot_x = ctx->cursor_hot_x;
+    out->hot_y = ctx->cursor_hot_y;
+    out->rgba = ctx->cursor_rgba.data();
 }
 
 extern "C" bool pyromirror_capture_get_bounds(pyromirror_capture_context* ctx, int32_t* x, int32_t* y, uint32_t* width, uint32_t* height) {

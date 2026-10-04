@@ -78,6 +78,8 @@ The computer is saved in your list under its own name.
 
 Press **Connect** next to the computer. The remote desktop opens in its own window. From now on this is the only step.
 
+The remote desktop is a program of its own: you can close the PyroMirror window and keep working in it. Opening PyroMirror again shows the connection, with **Disconnect**.
+
 To stop, close the window or use **Disconnect**. On the shared computer, **Stop sharing** ends it from that side.
 
 <br clear="right">
@@ -95,6 +97,8 @@ Move the pointer to the top edge of the remote desktop window for the toolbar: f
 | `Ctrl + Alt + Q` | Disconnect |
 
 Keys are sent as physical keys, so the remote computer's keyboard layout decides what they type.
+
+You see one mouse pointer: the remote computer's. Its shape (arrow, text cursor, resize handles) is sent to the viewer and drawn there, so it moves without network delay. On Linux desktops that cannot report the pointer separately, it is drawn into the picture instead and the viewer hides its own.
 
 ## Settings
 
@@ -158,7 +162,6 @@ On Windows, remote input cannot reach administrator windows or UAC prompts.
 - **Encryption.**
 - **Code signing on Windows.**
 - **HDR.** With HDR on, Windows hands out a washed-out picture.
-- **The mouse pointer in the picture on Windows.** The viewer's own pointer shows the position instead.
 - **A direct GPU path.** Frames take a detour through the CPU on both ends, which costs a few milliseconds.
 - **Clipboard sharing, file transfer, gamepads.**
 - **Changing resolution while sharing**, and choosing a monitor from the launcher.

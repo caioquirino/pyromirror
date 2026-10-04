@@ -23,8 +23,8 @@ use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, Audi
 use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent,
-    VideoCodecType, VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO,
-    MSG_TYPE_CODEC_PARAMS, MSG_TYPE_INPUT_EVENT,
+    CursorHeader, VideoCodecType, VideoColorProfile, CURSOR_IN_VIDEO, CURSOR_VISIBLE, MAX_CURSOR_SIDE,
+    MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS, MSG_TYPE_CURSOR, MSG_TYPE_INPUT_EVENT,
 };
 use source::{Source, SourceFrame, TestPattern};
 
@@ -372,6 +372,12 @@ fn serve_client(
         info!("Pairing ended: {}", e);
         e
     })?;
+    if hello.flags & pyromirror_proto::HELLO_PAIR_ONLY != 0 {
+        // The other side is only setting up or checking its pairing; no session follows, so
+        // this must not look like someone connecting.
+        info!("{} checked its pairing", accepted.name);
+        return Ok(());
+    }
     info!("Accepted {}", accepted.name);
     // Only paired clients can have their pairing taken away.
     let revocable = pairing.required.then_some(accepted.client_id);
@@ -488,6 +494,7 @@ fn serve_client(
             pipeline.packet_boundary,
             pipeline.frame_interval,
             send_socket,
+            &tcp,
             target,
             running,
             pace_mbps,
@@ -496,6 +503,32 @@ fn serve_client(
         let _ = tcp.shutdown(Shutdown::Both);
         result
     })
+}
+
+/// Tells the viewer what the pointer looks like.
+fn send_cursor(control: &mut &TcpStream, cursor: &pyromirror_capture::Cursor, scale: u32) -> std::io::Result<()> {
+    let fits = cursor.width <= MAX_CURSOR_SIDE as u32 && cursor.height <= MAX_CURSOR_SIDE as u32;
+    let has_image = fits && !cursor.in_video && !cursor.rgba.is_empty();
+    let mut flags = 0;
+    if cursor.visible {
+        flags |= CURSOR_VISIBLE;
+    }
+    if cursor.in_video {
+        flags |= CURSOR_IN_VIDEO;
+    }
+    let header = CursorHeader {
+        width: if has_image { cursor.width as u16 } else { 0 },
+        height: if has_image { cursor.height as u16 } else { 0 },
+        hot_x: cursor.hot_x.min(u16::MAX as u32) as u16,
+        hot_y: cursor.hot_y.min(u16::MAX as u32) as u16,
+        flags,
+        scale: scale.clamp(1, u16::MAX as u32) as u16,
+    };
+    write_message(control, MSG_TYPE_CURSOR, &header.serialize())?;
+    if has_image {
+        control.write_all(&cursor.rgba)?;
+    }
+    control.flush()
 }
 
 /// Applies one client input event to the host desktop.
@@ -521,10 +554,14 @@ fn stream_video(
     packet_boundary: usize,
     frame_interval: Duration,
     socket: UdpSocket,
+    mut control: &TcpStream,
     target: &Mutex<SocketAddr>,
     running: &AtomicBool,
     pace_mbps: u32,
 ) -> anyhow::Result<()> {
+    // The pointer is not part of the picture: its shape goes to the viewer, which draws it
+    // itself. `None` makes the first check send whatever is known.
+    let mut cursor_serial: Option<u64> = None;
     let mut sender = FrameSender::new(socket, *target.lock().unwrap(), pace_mbps);
 
     let start = Instant::now();
@@ -538,6 +575,8 @@ fn stream_video(
 
         let frame = source.next_frame(frame_interval)?;
         let encode_start = Instant::now();
+        // Borrow of `source` by the frame ends with the encode below; the pointer is checked
+        // after it.
         let packets = match frame {
             Some(frame) => Some(encode_frame(encoder, &frame, max_frame_bytes, packet_boundary)?),
             None if last_sent.map_or(true, |t| t.elapsed() >= IDLE_REFRESH) => {
@@ -555,6 +594,12 @@ fn stream_video(
                 Err(e) => warn!("Dropped a frame: {}", e),
             }
             last_sent = Some(Instant::now());
+        }
+        if let Some(cursor) = source.cursor(cursor_serial) {
+            cursor_serial = Some(cursor.serial);
+            if let Err(e) = send_cursor(&mut control, &cursor, source.scale()) {
+                debug!("Could not send the pointer shape: {}", e);
+            }
         }
         stats.report();
 

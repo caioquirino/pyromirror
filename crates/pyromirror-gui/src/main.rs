@@ -182,7 +182,15 @@ struct App {
     /// A running `pyromirror-server --check-permissions`, started by ticking "share automatically".
     permission_check: Option<Process>,
     permission_error: Vec<LogLine>,
+    /// The pairing step of a connection (`pyromirror-client --pair-only`). It runs as our child
+    /// so that it can ask for a code through this window.
     client: Option<Process>,
+    /// The remote desktop window itself. Like the server it runs detached, so it stays open
+    /// when this window is closed.
+    viewer: Daemon,
+    viewer_running: bool,
+    viewer_log: Vec<LogLine>,
+    viewer_expected: bool,
     /// Last lines of a process that stopped on its own with an error.
     server_error: Vec<LogLine>,
     client_error: Vec<LogLine>,
@@ -256,6 +264,10 @@ impl App {
             permission_check: None,
             permission_error: Vec::new(),
             client: None,
+            viewer: Daemon::viewer(),
+            viewer_running: false,
+            viewer_log: Vec::new(),
+            viewer_expected: false,
             server_error: Vec::new(),
             client_error: Vec::new(),
             local_address: local_address(),
@@ -274,6 +286,8 @@ impl App {
             demo,
             frames: 0,
         };
+        // A viewer left open by an earlier launcher is still "the current connection".
+        app.target = (app.config.last_target.name.clone(), app.config.last_target.address.clone());
         if app.screenshot.is_none() {
             if app.config.autostart && !autostart::is_set() {
                 // The login entry was removed outside PyroMirror; go along with that.
@@ -307,6 +321,17 @@ impl App {
                 let state = if self.server_running { host_state(&self.server_log) } else { HostState::Stopped };
                 self.announcer.observe(&state);
             }
+            self.viewer_running = self.viewer.is_running();
+            self.viewer_log = self.viewer.log();
+            if self.viewer_running {
+                self.viewer_expected = true;
+            } else if self.viewer_expected {
+                // Closed from its own window, or it failed.
+                self.viewer_expected = false;
+                if self.viewer_log.iter().any(|l| l.level == Level::Error) {
+                    self.client_error = Self::failure(&self.viewer_log);
+                }
+            }
             if self.server_running {
                 // Started by us or by the tray agent; either way a later exit is unexpected.
                 self.sharing_expected = true;
@@ -318,11 +343,28 @@ impl App {
             }
         }
 
+        // The pairing step finished: on success, open the remote desktop.
         if let Some(success) = self.client.as_mut().and_then(|p| p.exited()) {
-            if !success {
-                self.client_error = Self::failure(&self.client.as_ref().map(|p| p.log()).unwrap_or_default());
-            }
+            let log = self.client.as_ref().map(|p| p.log()).unwrap_or_default();
             self.client = None;
+            if success {
+                // Keep the entry current: the host's name may have changed, and entries carried
+                // over from older versions have no id yet.
+                if let Some((id, name)) = log.iter().find_map(|l| l.text.strip_prefix("Host: ")).and_then(|r| r.split_once(' ')) {
+                    let computer = Computer { name: name.to_owned(), address: self.target.1.clone(), id: id.to_owned() };
+                    self.target.0 = computer.name.clone();
+                    self.config.last_target = computer.clone();
+                    self.config.remember(computer);
+                }
+                self.viewer.stop();
+                match self.viewer.start(&self.config.client_args(&self.target.1)) {
+                    Ok(()) => self.viewer_expected = true,
+                    Err(e) => self.client_error.push(LogLine { level: Level::Error, text: format!("Could not open the remote desktop: {}", e) }),
+                }
+                self.server_polled -= std::time::Duration::from_secs(1);
+            } else {
+                self.client_error = Self::failure(&log);
+            }
         }
 
         if let Some(success) = self.permission_check.as_mut().and_then(|p| p.exited()) {
@@ -368,11 +410,6 @@ impl App {
             let prompts = log.iter().filter(|l| l.text.starts_with("Pairing code needed")).count();
             let address = self.target.0.clone();
             let mut stop = false;
-            // Once the host has identified itself, keep its entry current: its name may have
-            // changed, and entries carried over from older versions have no id yet.
-            if let Some((id, name)) = log.iter().find_map(|l| l.text.strip_prefix("Host: ")).and_then(|r| r.split_once(' ')) {
-                self.config.remember(Computer { name: name.to_owned(), address: self.target.1.clone(), id: id.to_owned() });
-            }
 
             match client_state(&log) {
                 ClientState::CodeNeeded { wrong, revoked } if prompts > self.codes_sent => {
@@ -407,12 +444,6 @@ impl App {
                         self.pairing_code.clear();
                     }
                 }
-                ClientState::Connected => {
-                    let title = format!("Connected to {}", address);
-                    stop = state_panel(ui, GREEN, &title, "The remote desktop is open in its own window.", |ui| {
-                        action_button(ui, "Disconnect", ButtonKind::Stop).clicked()
-                    });
-                }
                 // Connecting, or a code was just sent and is being checked.
                 _ => {
                     let title = format!("Connecting to {}...", address);
@@ -421,6 +452,21 @@ impl App {
             }
             if stop {
                 self.client = None;
+            }
+        } else if self.viewer_running {
+            // The remote desktop is its own program: it stays open if this window is closed.
+            let name = self.target.0.clone();
+            let streaming = client_state(&self.viewer_log) == ClientState::Connected;
+            let (color, title, detail) = if streaming {
+                (GREEN, format!("Connected to {}", name), "The remote desktop is open in its own window. You can close this window; the connection stays.")
+            } else {
+                (YELLOW, format!("Connecting to {}...", name), "")
+            };
+            let label = if streaming { "Disconnect" } else { "Cancel" };
+            if state_panel(ui, color, &title, detail, |ui| action_button(ui, label, ButtonKind::Stop).clicked()) {
+                self.viewer.stop();
+                self.viewer_expected = false;
+                self.server_polled -= std::time::Duration::from_secs(1);
             }
         } else {
             let mut connect_to = None;
@@ -481,13 +527,16 @@ impl App {
                 self.pairing_code.clear();
                 self.codes_sent = 0;
                 self.confirm_remove = None;
-                self.client =
-                    Self::start("pyromirror-client", &self.config.client_args(&computer.address), ui.ctx(), &mut self.client_error);
+                self.config.last_target = computer.clone();
+                // First make sure we are paired (asking for a code here if the other computer
+                // wants one); the remote desktop opens when that succeeds.
+                let args = [computer.address.clone(), "--pair-only".to_owned()];
+                self.client = Self::start("pyromirror-client", &args, ui.ctx(), &mut self.client_error);
             }
         }
         error_box(ui, &self.client_error);
 
-        if self.client.is_none() && ui.link(RichText::new("Fullscreen, mouse and sound: Client Options in Settings").small()).clicked() {
+        if self.client.is_none() && !self.viewer_running && ui.link(RichText::new("Fullscreen, mouse and sound: Client Options in Settings").small()).clicked() {
             self.config.tab = Tab::Settings;
             self.config.settings_page = SettingsPage::Connecting;
         }
@@ -1163,7 +1212,7 @@ impl eframe::App for App {
         }
         self.was_pairing = pairing;
         let sharing = self.server_running || self.demo.is_some();
-        let connected = self.client.as_ref().is_some_and(|c| client_state(&c.log()) == ClientState::Connected);
+        let connected = self.viewer_running && client_state(&self.viewer_log) == ClientState::Connected;
 
         egui::Panel::top("header").frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 0 })).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -1297,6 +1346,12 @@ mod tests {
         log.extend(lines(&["Accepted caio: laptop", "Sending video to 192.168.1.7:40000"]));
         assert!(host_state(&log) == HostState::Serving("caio: laptop (192.168.1.7)".into()));
         log.extend(lines(&["Client 192.168.1.7:51234 disconnected"]));
+        assert!(host_state(&log) == HostState::Ready);
+
+        // A computer that only sets up or checks its pairing never counts as connected.
+        log.extend(lines(&["Client connected from 192.168.1.7:51300", "caio: laptop checked its pairing"]));
+        assert!(host_state(&log) == HostState::Ready);
+        log.extend(lines(&["Client 192.168.1.7:51300 disconnected"]));
         assert!(host_state(&log) == HostState::Ready);
     }
 }
