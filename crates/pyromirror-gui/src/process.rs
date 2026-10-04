@@ -1,7 +1,7 @@
 //! Runs `pyromirror-server` / `pyromirror-client` as child processes and collects their log.
 
 use std::collections::VecDeque;
-use std::io::{BufRead, BufReader};
+use std::io::{BufRead, BufReader, Write};
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::sync::{Arc, Mutex};
@@ -61,7 +61,8 @@ impl Process {
     /// Starts the program `name` that lives next to this executable.
     pub fn spawn(name: &str, args: &[String], ctx: &egui::Context) -> std::io::Result<Self> {
         let mut command = Command::new(sibling(name));
-        command.args(args).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::piped());
+        // stdin stays open: the client reads a pairing code from it when the host asks for one.
+        command.args(args).stdin(Stdio::piped()).stdout(Stdio::null()).stderr(Stdio::piped());
         #[cfg(windows)]
         {
             use std::os::windows::process::CommandExt;
@@ -104,6 +105,11 @@ impl Process {
 
     pub fn log(&self) -> Vec<LogLine> {
         self.log.lock().unwrap().iter().cloned().collect()
+    }
+
+    /// Writes one line to the program's standard input.
+    pub fn send_line(&mut self, line: &str) -> bool {
+        self.child.stdin.as_mut().is_some_and(|stdin| writeln!(stdin, "{}", line).and_then(|_| stdin.flush()).is_ok())
     }
 
     pub fn stop(&mut self) {

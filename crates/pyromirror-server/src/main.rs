@@ -19,7 +19,7 @@ use pyromirror_audio::AudioCapture;
 use pyromirror_capture::{CaptureOptions, Capturer, InputInjector};
 use pyromirror_codec::{Chroma, Device, Encoder, Packets};
 use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
-use pyromirror_proto::auth::{self, AuthChallenge, AuthMethod, AuthResponse, AuthResult, TokenStore};
+use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent,
     VideoCodecType, VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO,
@@ -81,10 +81,6 @@ struct Args {
     #[arg(long)]
     monitor: Option<u32>,
 
-    /// Pairing code new clients must enter (default: a random 6-digit code, printed at start)
-    #[arg(long, value_name = "CODE", conflicts_with = "no_pairing")]
-    pairing_code: Option<String>,
-
     /// Let anyone who can reach this computer connect, without pairing
     #[arg(long)]
     no_pairing: bool,
@@ -132,55 +128,12 @@ struct Pipeline {
     pairing: Pairing,
 }
 
-/// Who may connect: clients paired earlier, and new ones that know the code.
+/// Who may connect: computers paired earlier, and new ones after a one-time code is typed.
 struct Pairing {
-    /// `None` lets everyone in.
-    code: Option<String>,
+    /// False lets everyone in.
+    required: bool,
     server_id: auth::Id,
     paired: TokenStore,
-}
-
-impl Pairing {
-    /// Runs the challenge-response with a freshly connected client.
-    fn authenticate(&mut self, tcp: &mut TcpStream) -> anyhow::Result<AuthResult> {
-        let challenge = AuthChallenge { required: self.code.is_some(), server_id: self.server_id, nonce: auth::random() };
-        write_message(tcp, auth::MSG_TYPE_AUTH_CHALLENGE, &challenge.serialize())?;
-
-        let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
-        let (msg_type, len) = read_message(tcp, &mut payload).context("no answer to the pairing challenge")?;
-        if msg_type != auth::MSG_TYPE_AUTH_RESPONSE {
-            bail!("expected a pairing answer, got message type {}", msg_type);
-        }
-        let response = AuthResponse::deserialize(&payload[..len])?;
-
-        let result = match (&self.code, response.method) {
-            (None, _) => AuthResult::Ok,
-            (Some(code), AuthMethod::Code) => {
-                if auth::verify_code(code, &challenge, &response.client_id, &response.mac) {
-                    let token = auth::derive_token(code, &challenge, &response.client_id);
-                    if let Err(e) = self.paired.insert(response.client_id, token) {
-                        warn!("Could not save the pairing; the client will need the code again: {}", e);
-                    }
-                    info!("Paired with a new client");
-                    AuthResult::Ok
-                } else {
-                    AuthResult::WrongCode
-                }
-            }
-            (Some(_), AuthMethod::Token) => match self.paired.get(&response.client_id) {
-                Some(token) if auth::verify_token(token, &challenge, &response.client_id, &response.mac) => AuthResult::Ok,
-                _ => AuthResult::NotPaired,
-            },
-            (Some(_), AuthMethod::None) => AuthResult::NotPaired,
-        };
-
-        if result != AuthResult::Ok {
-            // Makes guessing codes over the network slow.
-            std::thread::sleep(Duration::from_secs(2));
-        }
-        write_message(tcp, auth::MSG_TYPE_AUTH_RESULT, &[result as u8])?;
-        Ok(result)
-    }
 }
 
 /// Loopback audio capture. It runs for the lifetime of the server; samples are only queued while
@@ -311,21 +264,17 @@ fn main() -> anyhow::Result<()> {
 
     let config_dir = auth::config_dir().unwrap_or_else(std::env::temp_dir);
     let pairing = Pairing {
-        code: if args.no_pairing {
-            None
-        } else {
-            Some(args.pairing_code.as_deref().map(auth::normalize_code).unwrap_or_else(auth::generate_code))
-        },
+        required: !args.no_pairing,
         server_id: auth::local_id(&config_dir.join("server-id")),
         paired: TokenStore::load(config_dir.join("paired-clients")),
     };
-    match &pairing.code {
-        // The launcher reads this line to show the code.
-        Some(code) => {
-            info!("Pairing code: {}", code);
-            info!("{} client(s) already paired; new ones need the code", pairing.paired.len());
-        }
-        None => warn!("Pairing is off: anyone who can reach this computer can connect"),
+    if pairing.required {
+        info!(
+            "{} paired computer(s); a new one will be asked for a one-time code shown here",
+            pairing.paired.len()
+        );
+    } else {
+        warn!("Pairing is off: anyone who can reach this computer can connect");
     }
 
     let params = CodecParameters {
@@ -400,11 +349,23 @@ fn serve_client(
     }
     let hello = ClientHello::deserialize(&payload[..len])?;
 
-    match pipeline.pairing.authenticate(&mut tcp)? {
-        AuthResult::Ok => {}
-        AuthResult::WrongCode => bail!("wrong pairing code"),
-        AuthResult::NotPaired => bail!("client is not paired and sent no pairing code"),
-    }
+    // Leaves time for a person to read the code here and type it on the other computer.
+    tcp.set_read_timeout(Some(Duration::from_secs(120)))?;
+    let pairing = &mut pipeline.pairing;
+    // The launcher may have removed computers since the last connection.
+    pairing.paired.reload();
+    let server_name = auth::device_name();
+    let accepted = auth::serve(&mut tcp, pairing.required, pairing.server_id, &server_name, &mut pairing.paired, |name, code| {
+        // The launcher reads this line to show the request.
+        info!("Pairing request from {}: code {}", name, code);
+    })
+    .map_err(|e| {
+        info!("Pairing ended: {}", e);
+        e
+    })?;
+    info!("Accepted {}", accepted.name);
+    // Only paired clients can have their pairing taken away.
+    let revocable = pairing.required.then_some(accepted.client_id);
     tcp.set_read_timeout(None)?;
 
     let mut param_buf = [0u8; CodecParameters::SIZE];
@@ -421,7 +382,9 @@ fn serve_client(
     let send_socket = udp.try_clone()?;
 
     let (stream_w, stream_h) = (params.width as f64, params.height as f64);
-    let Pipeline { injector, audio, mtu, pace_mbps, .. } = pipeline;
+    let kick = tcp.try_clone()?;
+    let Pipeline { injector, audio, mtu, pace_mbps, pairing, .. } = pipeline;
+    let paired = &mut pairing.paired;
     // Only the channel and the flag cross into the audio thread; the capture itself stays put.
     let audio = audio.as_ref().map(|a| (&a.samples, &*a.wanted));
     let (injector, mtu, pace_mbps) = (injector.as_ref(), *mtu, *pace_mbps);
@@ -484,7 +447,19 @@ fn serve_client(
         // their source address is where video has to go, rather than the port it announced.
         scope.spawn(|| {
             let mut buf = [0u8; 64];
+            let mut last_check = Instant::now();
             while running.load(Ordering::Relaxed) {
+                // Removing a computer from the paired list (in the launcher) ends its session.
+                if let (Some(client_id), true) = (revocable, last_check.elapsed() >= Duration::from_secs(2)) {
+                    last_check = Instant::now();
+                    paired.reload();
+                    if paired.get(&client_id).is_none() {
+                        info!("{} was removed from the paired computers; disconnecting it", accepted.name);
+                        running.store(false, Ordering::Relaxed);
+                        let _ = kick.shutdown(Shutdown::Both);
+                        break;
+                    }
+                }
                 if let Ok((len, from)) = punch_socket.recv_from(&mut buf) {
                     if from.ip() == client_addr.ip() && &buf[..len] == UDP_PUNCH {
                         let mut target = target.lock().unwrap();

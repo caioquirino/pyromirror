@@ -224,8 +224,7 @@ cargo run --release --bin pyromirror-server -- \
 * `--mtu <BYTES>`: UDP datagram size (default: `1400` for standard Ethernet; `8900` for jumbo frames).
 * `--scale <N>`: Shrink the picture by an integer factor before encoding (default: `1`; `2` turns a 4K desktop into a 1080p stream).
 * `--pace-factor <X>`: Release datagrams at X times the bitrate (default: `2`). Lower values, down to `1.1`, smooth out bursts on Wi-Fi at the cost of a few milliseconds of latency.
-* `--pairing-code <CODE>`: Use this pairing code instead of a random one (see Pairing below).
-* `--no-pairing`: Let anyone who can reach the port connect.
+* `--no-pairing`: Let anyone who can reach the port connect (see Pairing below).
 * `--no-audio`: Do not capture or send audio.
 * `--no-input`: Ignore the client's mouse and keyboard (view-only).
 * `--monitor <INDEX>`: Windows only, monitor to capture (default: primary). On Linux the portal dialog picks the monitor.
@@ -241,9 +240,17 @@ On Windows, allow the server through the firewall when prompted (TCP and UDP on 
 
 #### Pairing
 
-The server prints a 6-digit pairing code when it starts (the launcher shows it while sharing is on). A computer connecting for the first time must supply it: type it into the launcher's Connect tab, or pass `--pairing-code` to the client. After that the two machines remember each other and no code is needed, even if addresses change. Pairings are stored in `%APPDATA%\pyromirror` / `~/.config/pyromirror` (`paired-clients` on the host, `paired-hosts` on the viewer); delete those files to forget them.
+A computer has to be paired with the host once before it can connect:
 
-Pairing keeps strangers from connecting. It does not encrypt anything: the stream and your keystrokes are still readable by others on the same network, and someone recording a first-time pairing could work out the code. Pair on a network you trust.
+1. The first time it connects, the host shows a one-time 6-digit code (in the launcher's Share tab, or in the server's log line `Pairing request from <name>: code <code>`).
+2. The connecting computer asks for that code: the launcher shows a prompt, and `pyromirror-client` on a terminal reads it from standard input. Three wrong attempts end the request.
+3. After that the two machines remember each other and connect without a code, even if addresses change.
+
+The code exists only while a request is pending and is never reused.
+
+The launcher lists the paired computers on both tabs, each with a **Remove** link. Removing a computer on the host disconnects it if it is connected; the next time it tries, it is told that its pairing is no longer valid and is asked for a new code. The lists live in `%APPDATA%\pyromirror` / `~/.config/pyromirror` (`paired-clients` on the host, `paired-hosts` on the viewer), one computer per line, and can also be edited by hand. `--no-pairing` on the server lets anyone connect.
+
+Pairing keeps strangers from connecting. It does not encrypt anything: the stream and your keystrokes are still readable by others on the same network, and someone recording a pairing could work out the code. Pair on a network you trust.
 
 ### 2. Starting the Client (Viewer)
 

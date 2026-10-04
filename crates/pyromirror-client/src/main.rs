@@ -23,7 +23,7 @@ use sdl3::render::FRect;
 
 use pyromirror_codec::{Chroma, Decoder, Device};
 use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
-use pyromirror_proto::auth::{self, AuthChallenge, AuthMethod, AuthResponse, AuthResult, TokenStore};
+use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent, VideoCodecType,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
@@ -47,10 +47,6 @@ struct Args {
     /// Start in fullscreen mode
     #[arg(short, long)]
     fullscreen: bool,
-
-    /// Pairing code shown by the host; only needed the first time you connect to it
-    #[arg(long, value_name = "CODE")]
-    pairing_code: Option<String>,
 
     /// Keep the mouse pointer inside the viewer window (toggle with Ctrl+Alt+L)
     #[arg(long)]
@@ -127,68 +123,46 @@ fn main() -> anyhow::Result<()> {
     let config_dir = auth::config_dir().unwrap_or_else(std::env::temp_dir);
     let client_id = auth::local_id(&config_dir.join("client-id"));
     let mut hosts = TokenStore::load(config_dir.join("paired-hosts"));
-    let code = args.pairing_code.as_deref().map(auth::normalize_code).filter(|c| !c.is_empty());
 
-    // A host that has forgotten us rejects our token; with a code at hand, pair again.
-    let mut use_token = true;
-    let (mut tcp, params) = loop {
-        info!("Connecting to {}", server_addr);
-        let mut tcp = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))
-            .with_context(|| format!("could not connect to {}", server_addr))?;
-        tcp.set_nodelay(true)?;
-        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
+    info!("Connecting to {}", server_addr);
+    let mut tcp = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))
+        .with_context(|| format!("could not connect to {}", server_addr))?;
+    tcp.set_nodelay(true)?;
+    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-        let mut hello = [0u8; ClientHello::SIZE];
-        ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
-        write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
+    let mut hello = [0u8; ClientHello::SIZE];
+    ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
+    write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
 
-        let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
-        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no reply from the server")?;
-        if msg_type != auth::MSG_TYPE_AUTH_CHALLENGE {
-            bail!("unexpected handshake reply (message type {}); is the host running an older version?", msg_type);
+    // A host that does not know this computer shows a one-time code, which the person types
+    // here: on the terminal, or into the launcher, which passes it on through our stdin.
+    let paired_now = auth::connect(&mut tcp, client_id, &auth::device_name(), &mut hosts, |prompt| {
+        if prompt.wrong_attempts > 0 {
+            warn!("Wrong pairing code, try again");
+        } else if prompt.pairing_revoked {
+            // The launcher reads this line too.
+            warn!("This computer is no longer paired with the host; it has to be paired again");
         }
-        let challenge = AuthChallenge::deserialize(&payload[..len])?;
-
-        let token = hosts.get(&challenge.server_id).filter(|_| use_token);
-        let (method, mac) = match (challenge.required, token, &code) {
-            (false, ..) => (AuthMethod::None, [0u8; 32]),
-            (true, Some(token), _) => (AuthMethod::Token, auth::token_proof(token, &challenge, &client_id)),
-            (true, None, Some(code)) => (AuthMethod::Code, auth::code_proof(code, &challenge, &client_id)),
-            (true, None, None) => bail!("this host asks for a pairing code: enter the code it shows"),
-        };
-        write_message(&mut tcp, auth::MSG_TYPE_AUTH_RESPONSE, &AuthResponse { method, client_id, mac }.serialize())?;
-
-        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no pairing result from the server")?;
-        if msg_type != auth::MSG_TYPE_AUTH_RESULT || len < 1 {
-            bail!("unexpected pairing reply (message type {})", msg_type);
+        // The launcher reads this line to show its pairing prompt.
+        info!("Pairing code needed: enter the code shown on the host");
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(n) if n > 0 && !line.trim().is_empty() => Some(line),
+            _ => None,
         }
-        match (AuthResult::from_byte(payload[0]), method, &code) {
-            (AuthResult::Ok, AuthMethod::Code, Some(code)) => {
-                let token = auth::derive_token(code, &challenge, &client_id);
-                match hosts.insert(challenge.server_id, token) {
-                    Ok(()) => info!("Paired with this host; the code will not be needed again"),
-                    Err(e) => warn!("Could not save the pairing; the code will be needed again: {}", e),
-                }
-            }
-            (AuthResult::Ok, ..) => {}
-            (AuthResult::WrongCode, ..) => bail!("wrong pairing code"),
-            (AuthResult::NotPaired, AuthMethod::Token, Some(_)) => {
-                use_token = false;
-                continue;
-            }
-            (AuthResult::NotPaired, ..) => {
-                bail!("this host no longer recognises this computer: enter the pairing code it shows")
-            }
-        }
+    })
+    .context("could not pair with the host")?;
+    if paired_now {
+        info!("Paired with this host; no code will be needed next time");
+    }
 
-        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no stream description from the server")?;
-        if msg_type != MSG_TYPE_CODEC_PARAMS {
-            bail!("unexpected handshake reply (message type {})", msg_type);
-        }
-        let params = CodecParameters::deserialize(&payload[..len])?;
-        tcp.set_read_timeout(None)?;
-        break (tcp, params);
-    };
+    let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
+    let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no stream description from the server")?;
+    if msg_type != MSG_TYPE_CODEC_PARAMS {
+        bail!("unexpected handshake reply (message type {})", msg_type);
+    }
+    let params = CodecParameters::deserialize(&payload[..len])?;
+    tcp.set_read_timeout(None)?;
 
     if params.video_codec != VideoCodecType::PyroWave {
         bail!("server offers {:?}, this client only decodes PyroWave", params.video_codec);

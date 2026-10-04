@@ -13,6 +13,8 @@ use std::path::PathBuf;
 
 use eframe::egui::{self, Color32, CornerRadius, Margin, RichText, Stroke, Vec2};
 
+use pyromirror_proto::auth::{self, TokenStore};
+
 use config::{Config, Tab};
 use process::{Level, LogLine, Process};
 
@@ -109,22 +111,31 @@ enum HostState {
     Starting,
     WaitingForPermission,
     Ready,
+    /// An unknown computer wants to connect; the code has to be typed on it.
+    PairingRequest { name: String, code: String },
     Serving(String),
     Failed,
 }
 
 fn host_state(log: &[LogLine]) -> HostState {
     let mut state = HostState::Starting;
+    let mut peer = String::new();
     for line in log {
         let text = line.text.as_str();
         if text.starts_with("Waiting for") && text.contains("permission") {
             state = HostState::WaitingForPermission;
         } else if text.starts_with("Listening on") {
             state = HostState::Ready;
-        } else if let Some(peer) = text.strip_prefix("Client connected from ") {
-            // Drop the ephemeral TCP port; the address is what people recognise.
-            let host = peer.rsplit_once(':').map_or(peer, |(host, _)| host);
-            state = HostState::Serving(host.to_owned());
+        } else if let Some(address) = text.strip_prefix("Client connected from ") {
+            // Drop the ephemeral TCP port; the address is what people recognise. Until the
+            // client has been accepted nothing is being shared with it yet.
+            peer = address.rsplit_once(':').map_or(address, |(host, _)| host).to_owned();
+        } else if let Some((name, code)) = text.strip_prefix("Pairing request from ").and_then(|r| r.rsplit_once(": code ")) {
+            // Formatted for reading across the room: "123 456".
+            let code = if code.len() == 6 { format!("{} {}", &code[..3], &code[3..]) } else { code.to_owned() };
+            state = HostState::PairingRequest { name: name.to_owned(), code };
+        } else if let Some(name) = text.strip_prefix("Accepted ") {
+            state = HostState::Serving(if peer.is_empty() { name.to_owned() } else { format!("{} ({})", name, peer) });
         } else if text.ends_with(" disconnected") || text.starts_with("Session with ") {
             state = HostState::Ready;
         }
@@ -132,10 +143,36 @@ fn host_state(log: &[LogLine]) -> HostState {
     state
 }
 
-/// The pairing code the server announced, formatted for reading aloud ("123 456").
-fn pairing_code(log: &[LogLine]) -> Option<String> {
-    let code = log.iter().find_map(|line| line.text.strip_prefix("Pairing code: "))?;
-    Some(if code.len() == 6 { format!("{} {}", &code[..3], &code[3..]) } else { code.to_owned() })
+fn pairing_file(name: &str) -> PathBuf {
+    auth::config_dir().unwrap_or_else(std::env::temp_dir).join(name)
+}
+
+/// What the viewer is doing, as far as its log tells.
+#[derive(Clone, PartialEq)]
+enum ClientState {
+    Connecting,
+    /// The host is showing a pairing code that has to be typed here. `revoked` means this
+    /// computer used to be paired and the host has removed it.
+    CodeNeeded { wrong: bool, revoked: bool },
+    Connected,
+}
+
+fn client_state(log: &[LogLine]) -> ClientState {
+    let mut state = ClientState::Connecting;
+    let (mut wrong, mut revoked) = (false, false);
+    for line in log {
+        let text = line.text.as_str();
+        if text.starts_with("Wrong pairing code") {
+            wrong = true;
+        } else if text.contains("no longer paired with the host") {
+            revoked = true;
+        } else if text.starts_with("Pairing code needed") {
+            state = ClientState::CodeNeeded { wrong, revoked };
+        } else if text.starts_with("Stream: ") {
+            state = ClientState::Connected;
+        }
+    }
+    state
 }
 
 /// This computer's address on the network it would use to reach others. No packet is sent:
@@ -156,8 +193,19 @@ struct App {
     server_error: Vec<LogLine>,
     client_error: Vec<LogLine>,
     local_address: Option<String>,
-    /// Pairing code typed on the Connect tab; deliberately not part of the saved settings.
+    /// Pairing code being typed into the prompt on the Connect tab.
     pairing_code: String,
+    /// How many pairing prompts of the current connection have been answered, so that an
+    /// answered prompt shows "checking" instead of asking again.
+    codes_sent: usize,
+    was_pairing: bool,
+    /// Computers allowed to connect to this one, and computers this one can connect to. Both
+    /// are re-read from disk regularly, because the server and viewer change them.
+    paired_clients: TokenStore,
+    paired_hosts: TokenStore,
+    stores_read: std::time::Instant,
+    /// The entry whose "Forget" was clicked and is waiting for confirmation.
+    confirm_forget: Option<auth::Id>,
     screenshot: Option<PathBuf>,
     /// Screenshot mode only: pretend the server is in this state.
     demo: Option<HostState>,
@@ -173,7 +221,8 @@ impl App {
             config.tab = if tab.as_deref().is_some_and(|t| t.starts_with("host")) { Tab::Host } else { Tab::Connect };
             demo = match tab.as_deref() {
                 Some("host-ready") => Some(HostState::Ready),
-                Some("host-serving") => Some(HostState::Serving("192.168.1.7".into())),
+                Some("host-serving") => Some(HostState::Serving("caio-laptop (192.168.1.7)".into())),
+                Some("host-pairing") => Some(HostState::PairingRequest { name: "caio-laptop".into(), code: "482 913".into() }),
                 _ => None,
             };
             path
@@ -187,6 +236,12 @@ impl App {
             client_error: Vec::new(),
             local_address: local_address(),
             pairing_code: String::new(),
+            codes_sent: 0,
+            was_pairing: false,
+            paired_clients: TokenStore::load(pairing_file("paired-clients")),
+            paired_hosts: TokenStore::load(pairing_file("paired-hosts")),
+            stores_read: std::time::Instant::now(),
+            confirm_forget: None,
             screenshot,
             demo,
             frames: 0,
@@ -221,11 +276,57 @@ impl App {
     }
 
     fn connect_tab(&mut self, ui: &mut egui::Ui) {
-        if self.client.is_some() {
-            let title = format!("Connected to {}", self.config.address.trim());
-            let stop = state_panel(ui, GREEN, &title, "The remote desktop is open in its own window.", |ui| {
-                action_button(ui, "Disconnect", ButtonKind::Stop).clicked()
-            });
+        if let Some(client) = &mut self.client {
+            let log = client.log();
+            let prompts = log.iter().filter(|l| l.text.starts_with("Pairing code needed")).count();
+            let address = self.config.address.trim().to_owned();
+            let mut stop = false;
+
+            match client_state(&log) {
+                ClientState::CodeNeeded { wrong, revoked } if prompts > self.codes_sent => {
+                    let detail = if wrong {
+                        "That code was not right. Check the code shown on the other computer and try again."
+                    } else if revoked {
+                        "The other computer has removed this one from its paired computers, so the old pairing no longer works. To connect again, type the code it is showing now."
+                    } else {
+                        "The other computer is showing a pairing code. Type it here; this is only needed once."
+                    };
+                    let title = if revoked && !wrong { format!("Pair with {} again", address) } else { format!("Pair with {}", address) };
+                    let submit = state_panel(ui, YELLOW, &title, detail, |ui| {
+                        let field = ui.add(
+                            egui::TextEdit::singleline(&mut self.pairing_code)
+                                .hint_text("123 456")
+                                .font(egui::FontId::monospace(22.0))
+                                .desired_width(f32::INFINITY)
+                                .margin(Margin::symmetric(10, 9)),
+                        );
+                        if self.pairing_code.is_empty() && !field.has_focus() {
+                            field.request_focus();
+                        }
+                        let enter = field.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                        let ready = self.pairing_code.chars().filter(|c| c.is_ascii_digit()).count() == 6;
+                        let pair = ui.add_enabled_ui(ready, |ui| action_button(ui, "Pair", ButtonKind::Primary).clicked()).inner;
+                        stop = ui.link("Cancel").clicked();
+                        ready && (pair || enter)
+                    });
+                    if submit {
+                        client.send_line(self.pairing_code.trim());
+                        self.codes_sent = prompts;
+                        self.pairing_code.clear();
+                    }
+                }
+                ClientState::Connected => {
+                    let title = format!("Connected to {}", address);
+                    stop = state_panel(ui, GREEN, &title, "The remote desktop is open in its own window.", |ui| {
+                        action_button(ui, "Disconnect", ButtonKind::Stop).clicked()
+                    });
+                }
+                // Connecting, or a code was just sent and is being checked.
+                _ => {
+                    let title = format!("Connecting to {}...", address);
+                    stop = state_panel(ui, YELLOW, &title, "", |ui| action_button(ui, "Cancel", ButtonKind::Stop).clicked());
+                }
+            }
             if stop {
                 self.client = None;
             }
@@ -235,7 +336,7 @@ impl App {
             } else {
                 (RED, "The connection ended with an error")
             };
-            let connect = state_panel(ui, color, title, "Enter the address shown on the computer you want to control.", |ui| {
+            let connect = state_panel(ui, color, title, "Enter the address shown on the computer you want to control. The first time, it will ask you for a pairing code.", |ui| {
                 let field = ui.add(
                     egui::TextEdit::singleline(&mut self.config.address)
                         .hint_text("Address, e.g. 192.168.1.20")
@@ -255,16 +356,6 @@ impl App {
                     });
                 }
 
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Pairing code").color(MUTED));
-                    ui.add(
-                        egui::TextEdit::singleline(&mut self.pairing_code)
-                            .hint_text("only the first time")
-                            .desired_width(150.0)
-                            .margin(Margin::symmetric(10, 6)),
-                    );
-                });
-
                 let ready = !self.config.address.trim().is_empty();
                 let clicked = ui.add_enabled_ui(ready, |ui| action_button(ui, "Connect", ButtonKind::Primary).clicked()).inner;
                 ready && (clicked || enter)
@@ -272,7 +363,9 @@ impl App {
             if connect {
                 let address = self.config.address.trim().to_owned();
                 self.config.remember(&address);
-                self.client = Self::start("pyromirror-client", &self.config.client_args(&self.pairing_code), ui.ctx(), &mut self.client_error);
+                self.pairing_code.clear();
+                self.codes_sent = 0;
+                self.client = Self::start("pyromirror-client", &self.config.client_args(), ui.ctx(), &mut self.client_error);
             }
         }
         error_box(ui, &self.client_error);
@@ -286,6 +379,16 @@ impl App {
                 ui.checkbox(&mut self.config.play_audio, "Play the remote computer's sound");
             });
         });
+
+        ui.add_space(4.0);
+        paired_card(
+            ui,
+            "Computers you are paired with",
+            "None yet. The first time you connect to a computer it will ask for a pairing code.",
+            "Removing one means it will ask for a pairing code again.",
+            &mut self.paired_hosts,
+            &mut self.confirm_forget,
+        );
 
         ui.add_space(4.0);
         card(ui, |ui| {
@@ -335,6 +438,11 @@ impl App {
                     None => "Waiting for a connection.".into(),
                 },
             ),
+            HostState::PairingRequest { name, .. } => (
+                YELLOW,
+                format!("{} wants to connect", name),
+                "Type this code on that computer to allow it. Ignore it if you were not expecting this.".into(),
+            ),
             HostState::Serving(peer) => (GREEN, "Sharing is on".into(), format!("{} is connected right now.", peer)),
         };
         (state, color, title, detail)
@@ -352,15 +460,12 @@ impl App {
                     ui.ctx().copy_text(address.clone());
                 }
             }
-            let code = if self.demo.is_some() { Some("482 913".to_owned()) } else { pairing_code(&log) };
-            if let Some(code) = code {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Pairing code").color(MUTED));
-                    ui.label(RichText::new(code).size(22.0).strong().monospace());
-                });
-                ui.label(RichText::new("A computer connecting for the first time has to enter this code.").color(MUTED).small());
+            if let HostState::PairingRequest { code, .. } = &state {
+                ui.label(RichText::new(code).size(34.0).strong().monospace());
             } else if running && !self.config.require_pairing {
                 ui.label(RichText::new("Pairing is off: anyone on your network can connect.").color(YELLOW));
+            } else if matches!(state, HostState::Ready) {
+                ui.label(RichText::new("A computer connecting for the first time will need a code that appears here.").color(MUTED).small());
             }
             if running {
                 action_button(ui, "Stop sharing", ButtonKind::Stop).clicked()
@@ -378,6 +483,15 @@ impl App {
         error_box(ui, &self.server_error);
 
         ui.add_space(4.0);
+        paired_card(
+            ui,
+            "Computers allowed to connect",
+            "None yet. A computer is added here after it enters a pairing code.",
+            "Removing one disconnects it and makes it pair again.",
+            &mut self.paired_clients,
+            &mut self.confirm_forget,
+        );
+
         ui.add_enabled_ui(!running, |ui| {
             card(ui, |ui| {
                 section(ui, "Picture");
@@ -400,7 +514,7 @@ impl App {
                 section(ui, "Sharing");
                 ui.checkbox(&mut self.config.share_audio, "Share this computer's sound");
                 ui.checkbox(&mut self.config.allow_control, "Allow mouse and keyboard control");
-                ui.checkbox(&mut self.config.require_pairing, "Ask new computers for a pairing code");
+                ui.checkbox(&mut self.config.require_pairing, "Require pairing for new computers");
                 egui::CollapsingHeader::new(RichText::new("Network").color(MUTED)).show(ui, |ui| {
                     row(ui, "Port", |ui| {
                         ui.add(egui::DragValue::new(&mut self.config.port).range(1024..=65535).speed(1));
@@ -443,6 +557,50 @@ fn card<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
             add(ui)
         })
         .inner
+}
+
+/// A list of paired computers, each with a two-step "Remove".
+fn paired_card(
+    ui: &mut egui::Ui,
+    title: &str,
+    empty: &str,
+    hint: &str,
+    store: &mut TokenStore,
+    confirm: &mut Option<auth::Id>,
+) {
+    card(ui, |ui| {
+        section(ui, title);
+        if store.is_empty() {
+            ui.label(RichText::new(empty).color(MUTED));
+            return;
+        }
+        let mut remove = None;
+        for device in store.devices() {
+            ui.horizontal(|ui| {
+                ui.label(&device.name);
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if *confirm == Some(device.id) {
+                        // Right-to-left: listed in reverse of how they read.
+                        if ui.link("Keep").clicked() {
+                            *confirm = None;
+                        }
+                        if ui.link(RichText::new("Yes, remove").color(RED)).clicked() {
+                            remove = Some(device.id);
+                        }
+                    } else if ui.link(RichText::new("Remove").color(MUTED)).clicked() {
+                        *confirm = Some(device.id);
+                    }
+                });
+            });
+        }
+        ui.label(RichText::new(hint).color(MUTED).small());
+        if let Some(id) = remove {
+            if let Err(e) = store.remove(&id) {
+                log::warn!("Could not update the paired computers: {}", e);
+            }
+            *confirm = None;
+        }
+    });
 }
 
 fn section(ui: &mut egui::Ui, title: &str) {
@@ -621,10 +779,22 @@ fn error_box(ui: &mut egui::Ui, lines: &[LogLine]) {
 impl eframe::App for App {
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         self.reap();
+        if self.stores_read.elapsed() >= std::time::Duration::from_secs(1) {
+            self.paired_clients.reload();
+            self.paired_hosts.reload();
+            self.stores_read = std::time::Instant::now();
+        }
 
-        let (_, share_color, share_title, _) = self.sharing_summary();
+        let (share_state, share_color, share_title, _) = self.sharing_summary();
+        // A pairing request needs attention on the Share tab; go there once when it appears.
+        let pairing = matches!(share_state, HostState::PairingRequest { .. });
+        if pairing && !self.was_pairing {
+            self.config.tab = Tab::Host;
+            ui.ctx().send_viewport_cmd(egui::ViewportCommand::RequestUserAttention(egui::UserAttentionType::Informational));
+        }
+        self.was_pairing = pairing;
         let sharing = self.server.is_some() || self.demo.is_some();
-        let connected = self.client.is_some();
+        let connected = self.client.as_ref().is_some_and(|c| client_state(&c.log()) == ClientState::Connected);
 
         egui::Panel::top("header").frame(egui::Frame::new().fill(BG).inner_margin(Margin { left: 18, right: 18, top: 14, bottom: 0 })).show(ui, |ui| {
             ui.horizontal(|ui| {
@@ -669,7 +839,8 @@ impl eframe::App for App {
             self.saved = self.config.clone();
         }
 
-        // While something is running, poll for it ending even if it logs nothing.
+        // While something is running, poll for it ending (and for new pairings) even if it
+        // logs nothing.
         if self.server.is_some() || self.client.is_some() {
             ui.ctx().request_repaint_after(std::time::Duration::from_millis(500));
         }
@@ -706,9 +877,22 @@ mod tests {
     }
 
     #[test]
-    fn pairing_code_is_read_from_the_log() {
-        assert_eq!(pairing_code(&lines(&["Capturing audio at 48000 Hz", "Pairing code: 042917"])), Some("042 917".into()));
-        assert_eq!(pairing_code(&lines(&["Pairing is off: anyone who can reach this computer can connect"])), None);
+    fn client_state_follows_the_viewer_log() {
+        let mut log = lines(&["Connecting to 10.0.0.2:9000"]);
+        assert!(client_state(&log) == ClientState::Connecting);
+        log.extend(lines(&["Pairing code needed: enter the code shown on the host"]));
+        assert!(client_state(&log) == ClientState::CodeNeeded { wrong: false, revoked: false });
+        log.extend(lines(&["Wrong pairing code, try again", "Pairing code needed: enter the code shown on the host"]));
+        assert!(client_state(&log) == ClientState::CodeNeeded { wrong: true, revoked: false });
+
+        let revoked = lines(&[
+            "Connecting to 10.0.0.2:9000",
+            "This computer is no longer paired with the host; it has to be paired again",
+            "Pairing code needed: enter the code shown on the host",
+        ]);
+        assert!(client_state(&revoked) == ClientState::CodeNeeded { wrong: false, revoked: true });
+        log.extend(lines(&["Paired with this host; no code will be needed next time", "Stream: 1920x1080 @ 60 fps"]));
+        assert!(client_state(&log) == ClientState::Connected);
     }
 
     #[test]
@@ -718,8 +902,13 @@ mod tests {
         assert!(host_state(&log) == HostState::WaitingForPermission);
         log.extend(lines(&["Listening on 0.0.0.0:9000 (TCP control + UDP video); waiting for a client"]));
         assert!(host_state(&log) == HostState::Ready);
-        log.extend(lines(&["Client connected from 192.168.1.7:51234", "Sending video to 192.168.1.7:40000"]));
-        assert!(host_state(&log) == HostState::Serving("192.168.1.7".into()));
+        // A connection alone is not "serving": the client has to be accepted first.
+        log.extend(lines(&["Client connected from 192.168.1.7:51234"]));
+        assert!(host_state(&log) == HostState::Ready);
+        log.extend(lines(&["Pairing request from caio: laptop: code 042917"]));
+        assert!(host_state(&log) == HostState::PairingRequest { name: "caio: laptop".into(), code: "042 917".into() });
+        log.extend(lines(&["Accepted caio: laptop", "Sending video to 192.168.1.7:40000"]));
+        assert!(host_state(&log) == HostState::Serving("caio: laptop (192.168.1.7)".into()));
         log.extend(lines(&["Client 192.168.1.7:51234 disconnected"]));
         assert!(host_state(&log) == HostState::Ready);
     }

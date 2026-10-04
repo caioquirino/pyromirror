@@ -126,12 +126,8 @@ impl Config {
         args
     }
 
-    /// `pairing_code` is what the person typed for this connection; it is never saved.
-    pub fn client_args(&self, pairing_code: &str) -> Vec<String> {
+    pub fn client_args(&self) -> Vec<String> {
         let mut args = vec![self.address.trim().to_owned()];
-        if !pairing_code.trim().is_empty() {
-            args.extend(["--pairing-code".into(), pairing_code.trim().to_owned()]);
-        }
         if self.fullscreen {
             args.push("--fullscreen".into());
         }
@@ -159,14 +155,13 @@ mod tests {
     #[test]
     fn args_reflect_toggles() {
         let mut config = Config { address: " 10.0.0.2 ".into(), ..Default::default() };
-        assert_eq!(config.client_args(""), ["10.0.0.2"]);
-        assert_eq!(config.client_args(" 123 456 "), ["10.0.0.2", "--pairing-code", "123 456"]);
+        assert_eq!(config.client_args(), ["10.0.0.2"]);
         config.fullscreen = true;
         config.lock_mouse = true;
         config.play_audio = false;
         config.share_audio = false;
         config.chroma_444 = false;
-        assert_eq!(config.client_args(""), ["10.0.0.2", "--fullscreen", "--lock-mouse", "--no-audio"]);
+        assert_eq!(config.client_args(), ["10.0.0.2", "--fullscreen", "--lock-mouse", "--no-audio"]);
         let server = config.server_args();
         assert!(server.contains(&"--no-audio".to_string()) && !server.contains(&"--no-input".to_string()));
         assert!(!server.contains(&"--no-pairing".to_string()));

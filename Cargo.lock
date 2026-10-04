@@ -2401,6 +2401,7 @@ dependencies = [
  "eframe",
  "env_logger",
  "log",
+ "pyromirror-proto",
  "serde",
  "serde_json",
 ]
