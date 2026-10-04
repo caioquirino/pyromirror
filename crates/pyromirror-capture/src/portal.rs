@@ -4,8 +4,8 @@
 //! covers X11 sessions on those desktops. The portal shows the user a permission dialog; the
 //! choice is remembered through a restore token so the dialog only appears on first use.
 //!
-//! Desktops whose portal has no RemoteDesktop interface (wlroots) get a view-only ScreenCast
-//! session.
+//! Desktops whose portal has no RemoteDesktop interface (wlroots) get a ScreenCast-only
+//! session; input then goes through the compositor instead (see `wlr`).
 
 use std::os::fd::{IntoRawFd, RawFd};
 use std::path::PathBuf;
@@ -120,7 +120,7 @@ async fn open_remote(screencast: &Screencast, cursor: CursorMode) -> Result<Opti
     let session = match remote.create_session(Default::default()).await {
         Ok(session) => session,
         Err(e) => {
-            log::warn!("RemoteDesktop portal unavailable ({}); the session will be view-only", e);
+            log::info!("RemoteDesktop portal unavailable ({}); sharing the screen only through the portal", e);
             return Ok(None);
         }
     };

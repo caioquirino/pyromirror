@@ -1,0 +1,10 @@
+{
+    "layer": "top",
+    "position": "bottom",
+    "height": 32,
+    "modules-left": ["wlr/taskbar"],
+    "modules-right": ["tray", "clock"],
+    "wlr/taskbar": { "format": "{icon} {title:.24}", "icon-size": 18, "on-click": "activate" },
+    "tray": { "icon-size": 22, "spacing": 8 },
+    "clock": { "format": "{:%H:%M:%S}", "interval": 1 }
+}

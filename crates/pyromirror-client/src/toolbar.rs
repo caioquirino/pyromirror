@@ -13,25 +13,21 @@ use std::time::{Duration, Instant};
 use sdl3::pixels::Color;
 use sdl3::render::{BlendMode, FRect, WindowCanvas};
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Action {
-    Fullscreen,
-    KeyboardGrab,
-    MouseLock,
-    RelativeMouse,
-    Mute,
-    Disconnect,
-}
+pub use pyromirror_proto::control::Action;
 
-/// Menu rows: what they do, their label, and the keyboard shortcut (after "Ctrl+Alt+").
-const ITEMS: [(Action, &str, &str); 6] = [
-    (Action::Fullscreen, "Fullscreen", "F"),
-    (Action::KeyboardGrab, "Grab keys", "G"),
-    (Action::MouseLock, "Lock mouse", "L"),
-    (Action::RelativeMouse, "Relative mouse", "M"),
-    (Action::Mute, "Mute", ""),
-    (Action::Disconnect, "Disconnect", "Q"),
+/// Menu rows: what they do and the keyboard shortcut (after "Ctrl+Alt+").
+const ITEMS: [(Action, &str); 6] = [
+    (Action::Fullscreen, "F"),
+    (Action::KeyboardGrab, "G"),
+    (Action::MouseLock, "L"),
+    (Action::RelativeMouse, "M"),
+    (Action::Mute, ""),
+    (Action::Disconnect, "Q"),
 ];
+
+/// Shown for as long as relative mouse mode is on: there is no pointer to reach the menu with,
+/// so the way out has to be in sight.
+const RELATIVE_REMINDER: &str = "Ctrl+Alt+M frees the mouse";
 
 const TEXT_SCALE: f32 = 2.0;
 const CHAR: f32 = 8.0 * TEXT_SCALE;
@@ -86,6 +82,7 @@ pub struct Toolbar {
     position: f32,
     drag: Option<Drag>,
     notice: Option<(String, Instant)>,
+    relative: bool,
 }
 
 fn text_width(text: &str) -> f32 {
@@ -114,6 +111,7 @@ impl Toolbar {
             position: if position.is_finite() { position.clamp(0.0, 1.0) } else { 0.5 },
             drag: None,
             notice: None,
+            relative: false,
         };
         toolbar.notify("Menu: move the pointer to the top edge");
         toolbar
@@ -128,12 +126,18 @@ impl Toolbar {
         self.notice = Some((text.to_string(), Instant::now() + NOTICE_TIME));
     }
 
+    /// Relative mouse mode replaces the handle with a reminder of how to leave it. Returns true if
+    /// the window needs to be redrawn.
+    pub fn set_relative(&mut self, relative: bool) -> bool {
+        std::mem::replace(&mut self.relative, relative) != relative
+    }
+
     fn layout(&self, window_width: f32, stats: &str) -> Layout {
         let handle_left = (self.position * window_width - HANDLE_W / 2.0).clamp(0.0, (window_width - HANDLE_W).max(0.0));
         let handle = FRect::new(handle_left, 0.0, HANDLE_W, HANDLE_H);
 
-        let label_width = ITEMS.iter().map(|(_, label, _)| text_width(label)).fold(0.0, f32::max);
-        let shortcut_width = ITEMS.iter().map(|(_, _, key)| text_width(&shortcut(key))).fold(0.0, f32::max);
+        let label_width = ITEMS.iter().map(|(action, _)| text_width(action.label())).fold(0.0, f32::max);
+        let shortcut_width = ITEMS.iter().map(|(_, key)| text_width(&shortcut(key))).fold(0.0, f32::max);
         let narrow = PAD + CHECK + PAD + label_width + PAD;
         let wide = narrow + PAD + shortcut_width;
         // Drop the shortcuts rather than overflow a narrow window.
@@ -252,7 +256,7 @@ impl Toolbar {
 
     /// Draws the menu. `active` says which toggles are on.
     pub fn draw(&self, canvas: &mut WindowCanvas, window_width: f32, stats: &str, active: impl Fn(Action) -> bool) {
-        if self.state == State::Hidden && self.notice.is_none() {
+        if self.state == State::Hidden && self.notice.is_none() && !self.relative {
             return;
         }
         let layout = self.layout(window_width, stats);
@@ -279,7 +283,18 @@ impl Toolbar {
             }
         }
 
-        if self.state != State::Hidden {
+        if self.relative {
+            // Small print (the font's own size), where the handle would be.
+            let width = RELATIVE_REMINDER.chars().count() as f32 * 8.0 + 16.0;
+            let centre = layout.handle.x + HANDLE_W / 2.0;
+            let left = (centre - width / 2.0).clamp(0.0, (window_width - width).max(0.0));
+            canvas.set_draw_color(BAR);
+            let _ = canvas.fill_rect(FRect::new(left, 0.0, width, HANDLE_H));
+            canvas.set_draw_color(ACCENT);
+            let _ = canvas.fill_rect(FRect::new(left, HANDLE_H - 2.0, width, 2.0));
+            canvas.set_draw_color(TEXT);
+            let _ = canvas.draw_debug_text(RELATIVE_REMINDER, (left + 8.0, 5.0));
+        } else if self.state != State::Hidden {
             let handle = layout.handle;
             let hot = self.drag.is_some() || self.pointer.is_some_and(|p| contains(&handle, p)) || self.state == State::Open;
             canvas.set_draw_color(BAR);
@@ -297,7 +312,8 @@ impl Toolbar {
             canvas.set_draw_color(BAR);
             let _ = canvas.fill_rect(layout.panel);
 
-            for ((action, label, key), row) in ITEMS.iter().zip(&layout.rows) {
+            for ((action, key), row) in ITEMS.iter().zip(&layout.rows) {
+                let label = action.label();
                 let hovered = self.pointer.is_some_and(|p| contains(row, p));
                 let danger = *action == Action::Disconnect;
                 if hovered {
@@ -422,10 +438,13 @@ mod tests {
     }
 
     #[test]
-    fn relative_mode_hides_everything() {
+    fn relative_mode_hides_the_menu_and_asks_for_a_redraw_once() {
         let mut toolbar = settled(0.5);
         click(&mut toolbar, (960.0, 1.0));
         toolbar.update(None, W, "");
         assert_eq!(toolbar.state, State::Hidden);
+        assert!(toolbar.set_relative(true));
+        assert!(!toolbar.set_relative(true));
+        assert!(toolbar.set_relative(false));
     }
 }

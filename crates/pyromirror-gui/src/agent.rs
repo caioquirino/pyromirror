@@ -6,8 +6,10 @@ use std::time::Duration;
 
 use crate::config::Config;
 use crate::daemon::{sibling, Daemon};
-use crate::state::{host_state, HostState};
-use crate::tray::{Indicator, Tray, TrayEvent};
+use crate::state::{client_state, host_state, viewed_host, ClientState, HostState};
+use pyromirror_proto::control::{self, Side};
+
+use crate::tray::{Indicator, Session, Sessions, Tray, TrayEvent};
 
 /// Opens the launcher window, unless one is already open.
 fn open_window() {
@@ -32,6 +34,27 @@ pub fn summarize(state: &HostState) -> (Indicator, String) {
     }
 }
 
+/// The remote desktop this computer is viewing, once its picture is up.
+fn viewed_session(viewer: &Daemon) -> Option<Session> {
+    if !viewer.is_running() {
+        return None;
+    }
+    let toggles = control::toggles(Side::Viewer)?;
+    let log = viewer.log();
+    if client_state(&log) != ClientState::Connected {
+        return None;
+    }
+    Some(Session { name: viewed_host(&log).unwrap_or_else(|| "Remote".to_owned()), toggles })
+}
+
+/// The session of the computer that is viewing this one, if its viewer can be steered from here.
+fn served_session(state: &HostState) -> Option<Session> {
+    let HostState::Serving(peer) = state else { return None };
+    // "name (address)": the name is enough for a menu title.
+    let name = peer.split_once(" (").map_or(peer.as_str(), |(name, _)| name);
+    Some(Session { name: name.to_owned(), toggles: control::toggles(Side::Host)? })
+}
+
 pub fn run() {
     let agent = Daemon::agent();
     if !agent.claim() {
@@ -39,6 +62,7 @@ pub fn run() {
         return;
     }
     let server = Daemon::server();
+    let viewer = Daemon::viewer();
 
     let config = Config::load();
     if config.auto_share {
@@ -81,7 +105,8 @@ pub fn run() {
         announcer.observe(&state);
         let (indicator, tooltip) = summarize(&state);
         if let Some(tray) = &mut tray {
-            tray.update(indicator, &tooltip, running);
+            let sessions = Sessions { viewing: viewed_session(&viewer), serving: served_session(&state) };
+            tray.update(indicator, &tooltip, running, &sessions);
             tray.pump(Duration::from_millis(400));
         } else {
             std::thread::sleep(Duration::from_millis(400));
@@ -99,6 +124,11 @@ pub fn run() {
                     match server.start(&Config::load().server_args()) {
                         Ok(()) => started_here = true,
                         Err(e) => log::error!("Could not start sharing: {}", e),
+                    }
+                }
+                TrayEvent::Session(side, action) => {
+                    if let Err(e) = control::send(side, action) {
+                        log::warn!("Could not reach the session: {}", e);
                     }
                 }
                 TrayEvent::Quit => {

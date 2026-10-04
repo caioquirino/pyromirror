@@ -1,0 +1,4 @@
+swaybg -c "#24304a" >/dev/null 2>&1 &
+mako >/dev/null 2>&1 &
+waybar >/dev/null 2>&1 &
+foot >/dev/null 2>&1 &

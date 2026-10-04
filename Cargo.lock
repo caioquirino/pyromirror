@@ -2968,6 +2968,9 @@ dependencies = [
  "pkg-config",
  "thiserror 1.0.69",
  "tokio",
+ "wayland-client",
+ "wayland-protocols-misc",
+ "wayland-protocols-wlr",
  "windows-sys 0.61.2",
 ]
 

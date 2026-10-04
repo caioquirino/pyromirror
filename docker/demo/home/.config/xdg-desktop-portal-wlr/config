@@ -1,0 +1,5 @@
+# Share the one virtual screen without asking: there is nobody in the container to click.
+[screencast]
+chooser_type=none
+output_name=HEADLESS-1
+max_fps=60

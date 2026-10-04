@@ -1,7 +1,8 @@
 //! Injecting the client's mouse and keyboard into the captured desktop.
 //!
 //! - Windows: `SendInput`.
-//! - Linux: the RemoteDesktop portal session that also provides the screen cast.
+//! - Linux: the RemoteDesktop portal session that also provides the screen cast, or, on wlroots
+//!   desktops whose portal has none, the compositor's virtual pointer and keyboard.
 
 use std::collections::HashSet;
 use std::sync::Mutex;
@@ -174,41 +175,48 @@ mod linux_backend {
     use ashpd::desktop::remote_desktop::{Axis, KeyState, NotifyPointerAxisOptions};
 
     use crate::portal::RemoteControl;
+    use crate::wlr::WlrInput;
 
-    pub(crate) struct Backend {
-        pub remote: Arc<RemoteControl>,
+    pub(crate) enum Backend {
+        /// The RemoteDesktop portal session that also provides the screen cast (GNOME, KDE).
+        Portal(Arc<RemoteControl>),
+        /// The compositor's virtual pointer and keyboard (wlroots desktops).
+        Wlr(WlrInput),
     }
 
     fn state(down: bool) -> KeyState {
         if down { KeyState::Pressed } else { KeyState::Released }
     }
 
+    fn run<F: std::future::Future<Output = ashpd::Result<()>>>(remote: &RemoteControl, what: &str, call: F) {
+        if let Err(e) = remote.runtime.block_on(call) {
+            // The first failure is worth seeing; after that it would flood the log.
+            static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+            if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                log::debug!("Portal {} failed: {}", what, e);
+            } else {
+                log::warn!("Portal {} failed: {} (further input errors are logged at debug level)", what, e);
+            }
+        }
+    }
+
     impl Backend {
-        fn run<F: std::future::Future<Output = ashpd::Result<()>>>(&self, what: &str, call: F) {
-            if let Err(e) = self.remote.runtime.block_on(call) {
-                // The first failure is worth seeing; after that it would flood the log.
-                static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-                if WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                    log::debug!("Portal {} failed: {}", what, e);
-                } else {
-                    log::warn!("Portal {} failed: {} (further input errors are logged at debug level)", what, e);
+        pub fn pointer_absolute(&self, x: f64, y: f64) {
+            match self {
+                Backend::Portal(r) => {
+                    // Stream coordinates are in the stream's logical size.
+                    let (x, y) = (x * (r.width - 1.0).max(0.0), y * (r.height - 1.0).max(0.0));
+                    run(r, "pointer motion", r.proxy.notify_pointer_motion_absolute(&r.session, r.node, x, y, Default::default()));
                 }
+                Backend::Wlr(wlr) => wlr.pointer_absolute(x, y),
             }
         }
 
-        pub fn pointer_absolute(&self, x: f64, y: f64) {
-            let r = &self.remote;
-            // Stream coordinates are in the stream's logical size.
-            let (x, y) = (x * (r.width - 1.0).max(0.0), y * (r.height - 1.0).max(0.0));
-            self.run(
-                "pointer motion",
-                r.proxy.notify_pointer_motion_absolute(&r.session, r.node, x, y, Default::default()),
-            );
-        }
-
         pub fn pointer_relative(&self, dx: f64, dy: f64) {
-            let r = &self.remote;
-            self.run("pointer motion", r.proxy.notify_pointer_motion(&r.session, dx, dy, Default::default()));
+            match self {
+                Backend::Portal(r) => run(r, "pointer motion", r.proxy.notify_pointer_motion(&r.session, dx, dy, Default::default())),
+                Backend::Wlr(wlr) => wlr.pointer_relative(dx, dy),
+            }
         }
 
         pub fn button(&self, button: u8, down: bool) {
@@ -221,41 +229,39 @@ mod linux_backend {
                 5 => 0x114,
                 _ => return,
             };
-            let r = &self.remote;
-            self.run("button", r.proxy.notify_pointer_button(&r.session, code, state(down), Default::default()));
+            match self {
+                Backend::Portal(r) => run(r, "button", r.proxy.notify_pointer_button(&r.session, code, state(down), Default::default())),
+                Backend::Wlr(wlr) => wlr.button(code as u32, down),
+            }
         }
 
         pub fn wheel(&self, dx: i32, dy: i32) {
-            let r = &self.remote;
             // Wayland scrolls down / right for positive values, the opposite of our dy.
             let (dx, dy) = (dx, -dy);
+            let r = match self {
+                Backend::Portal(r) => r,
+                Backend::Wlr(wlr) => return wlr.wheel(dx, dy),
+            };
             // Whole notches go out as wheel clicks, which every application understands. Only
             // what is left over (touchpads, high-resolution wheels) is sent as smooth scrolling,
             // at roughly 15 units per notch.
             for (axis, steps) in [(Axis::Vertical, dy / 120), (Axis::Horizontal, dx / 120)] {
                 if steps != 0 {
-                    self.run(
-                        "scroll",
-                        r.proxy.notify_pointer_axis_discrete(&r.session, axis, steps, Default::default()),
-                    );
+                    run(r, "scroll", r.proxy.notify_pointer_axis_discrete(&r.session, axis, steps, Default::default()));
                 }
             }
             let (rx, ry) = (dx % 120, dy % 120);
             if rx != 0 || ry != 0 {
                 let (px, py) = (rx as f64 / 120.0 * 15.0, ry as f64 / 120.0 * 15.0);
-                self.run(
-                    "scroll",
-                    r.proxy.notify_pointer_axis(&r.session, px, py, NotifyPointerAxisOptions::default()),
-                );
+                run(r, "scroll", r.proxy.notify_pointer_axis(&r.session, px, py, NotifyPointerAxisOptions::default()));
             }
         }
 
         pub fn key(&self, evdev: u16, down: bool) {
-            let r = &self.remote;
-            self.run(
-                "key",
-                r.proxy.notify_keyboard_keycode(&r.session, evdev as i32, state(down), Default::default()),
-            );
+            match self {
+                Backend::Portal(r) => run(r, "key", r.proxy.notify_keyboard_keycode(&r.session, evdev as i32, state(down), Default::default())),
+                Backend::Wlr(wlr) => wlr.key(evdev, down),
+            }
         }
     }
 }

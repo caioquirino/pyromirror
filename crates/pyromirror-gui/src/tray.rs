@@ -4,6 +4,7 @@
 //! - Linux: a StatusNotifierItem over D-Bus (ksni). KDE shows these natively; GNOME needs the
 //!   AppIndicator extension, without which there simply is no icon.
 
+use pyromirror_proto::control::{Action, Side, Toggles};
 use std::sync::mpsc::Sender;
 use std::time::Duration;
 
@@ -11,7 +12,40 @@ use std::time::Duration;
 pub enum TrayEvent {
     Open,
     ToggleSharing,
+    /// Something from the menu of a session: the one this computer is viewing, or (`Side::Host`)
+    /// the one of the computer that is viewing this one.
+    Session(Side, Action),
     Quit,
+}
+
+/// A session with another computer, for its menu in the tray.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Session {
+    /// The other computer.
+    pub name: String,
+    pub toggles: Toggles,
+}
+
+/// The sessions this computer is part of: at most one it views, and one in which it is viewed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Sessions {
+    pub viewing: Option<Session>,
+    pub serving: Option<Session>,
+}
+
+impl Sessions {
+    #[cfg(target_os = "linux")]
+    fn each(&self) -> impl Iterator<Item = (Side, &Session)> {
+        let viewing = self.viewing.as_ref().map(|s| (Side::Viewer, s));
+        let serving = self.serving.as_ref().map(|s| (Side::Host, s));
+        viewing.into_iter().chain(serving)
+    }
+}
+
+impl Session {
+    fn title(&self) -> String {
+        format!("{} session", self.name)
+    }
 }
 
 /// What the icon's status dot shows.
@@ -135,8 +169,9 @@ impl Tray {
     }
 
     /// Reflects the current state. Cheap when nothing changed.
-    pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool) {
-        self.0.update(indicator, tooltip, sharing);
+    /// Each session gets a submenu with what can be switched in it.
+    pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool, sessions: &Sessions) {
+        self.0.update(indicator, tooltip, sharing, sessions);
     }
 
     /// Lets the icon process clicks for up to `wait`. Must be called regularly, from the thread
@@ -157,6 +192,7 @@ mod imp {
         indicator: Indicator,
         tooltip: String,
         sharing: bool,
+        sessions: Sessions,
     }
 
     impl ksni::Tray for Model {
@@ -191,7 +227,7 @@ mod imp {
         }
 
         fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
-            use ksni::menu::StandardItem;
+            use ksni::menu::{CheckmarkItem, StandardItem, SubMenu};
             let item = |label: &str, event: TrayEvent| -> ksni::MenuItem<Self> {
                 StandardItem {
                     label: label.into(),
@@ -202,38 +238,60 @@ mod imp {
                 }
                 .into()
             };
-            vec![
+            let mut menu = vec![
                 item("Open PyroMirror", TrayEvent::Open),
                 item(if self.sharing { "Stop sharing" } else { "Start sharing" }, TrayEvent::ToggleSharing),
-                ksni::MenuItem::Separator,
-                item("Quit", TrayEvent::Quit),
-            ]
+            ];
+            for (side, session) in self.sessions.each() {
+                let mut submenu: Vec<ksni::MenuItem<Self>> = Action::ALL
+                    .into_iter()
+                    .filter(|action| *action != Action::Disconnect)
+                    .map(|action| {
+                        CheckmarkItem {
+                            label: action.label().into(),
+                            checked: session.toggles.get(action),
+                            activate: Box::new(move |model: &mut Self| {
+                                let _ = model.events.send(TrayEvent::Session(side, action));
+                            }),
+                            ..Default::default()
+                        }
+                        .into()
+                    })
+                    .collect();
+                submenu.push(ksni::MenuItem::Separator);
+                submenu.push(item(Action::Disconnect.label(), TrayEvent::Session(side, Action::Disconnect)));
+                menu.push(SubMenu { label: session.title(), submenu, ..Default::default() }.into());
+            }
+            menu.push(ksni::MenuItem::Separator);
+            menu.push(item("Quit", TrayEvent::Quit));
+            menu
         }
     }
 
     pub struct Tray {
         handle: ksni::blocking::Handle<Model>,
-        shown: (Indicator, String, bool),
+        shown: (Indicator, String, bool, Sessions),
     }
 
     impl Tray {
         pub fn new(events: Sender<TrayEvent>) -> Result<Self, String> {
-            let shown = (Indicator::Off, String::new(), false);
-            let model = Model { events, indicator: shown.0, tooltip: shown.1.clone(), sharing: shown.2 };
+            let shown = (Indicator::Off, String::new(), false, Sessions::default());
+            let model = Model { events, indicator: shown.0, tooltip: shown.1.clone(), sharing: shown.2, sessions: Sessions::default() };
             let handle = model.spawn().map_err(|e| e.to_string())?;
             Ok(Self { handle, shown })
         }
 
-        pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool) {
-            if self.shown == (indicator, tooltip.to_owned(), sharing) {
+        pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool, sessions: &Sessions) {
+            let state = (indicator, tooltip.to_owned(), sharing, sessions.clone());
+            if self.shown == state {
                 return;
             }
-            self.shown = (indicator, tooltip.to_owned(), sharing);
-            let tooltip = tooltip.to_owned();
+            self.shown = state.clone();
             self.handle.update(move |model| {
-                model.indicator = indicator;
-                model.tooltip = tooltip;
-                model.sharing = sharing;
+                model.indicator = state.0;
+                model.tooltip = state.1;
+                model.sharing = state.2;
+                model.sessions = state.3;
             });
         }
 
@@ -248,7 +306,7 @@ mod imp {
 mod imp {
     use std::time::Instant;
 
-    use tray_icon::menu::{Menu, MenuEvent, MenuItem, PredefinedMenuItem};
+    use tray_icon::menu::{CheckMenuItem, Menu, MenuEvent, MenuItem, PredefinedMenuItem, Submenu};
     use tray_icon::{Icon, TrayIcon, TrayIconBuilder, TrayIconEvent};
     use windows_sys::Win32::UI::WindowsAndMessaging::{DispatchMessageW, PeekMessageW, TranslateMessage, MSG, PM_REMOVE};
 
@@ -256,9 +314,66 @@ mod imp {
 
     pub struct Tray {
         icon: TrayIcon,
+        menu: Menu,
         toggle: MenuItem,
+        viewing: SessionMenu,
+        serving: SessionMenu,
         events: Sender<TrayEvent>,
         shown: (Indicator, String, bool),
+    }
+
+    /// Where the session submenus go: after "Open" and the sharing toggle.
+    const SESSION_POSITION: usize = 2;
+
+    /// A session's submenu; in the tray menu only while there is such a session.
+    struct SessionMenu {
+        submenu: Submenu,
+        checks: Vec<(Action, CheckMenuItem)>,
+        shown: bool,
+    }
+
+    /// Menu item ids carry the side they belong to.
+    fn prefix(side: Side) -> &'static str {
+        match side {
+            Side::Viewer => "viewer:",
+            Side::Host => "host:",
+        }
+    }
+
+    impl SessionMenu {
+        fn new(side: Side) -> Result<Self, String> {
+            let id = |action: Action| format!("{}{}", prefix(side), action.name());
+            let submenu = Submenu::with_id(prefix(side), "Session", true);
+            let mut checks = Vec::new();
+            for action in Action::ALL.into_iter().filter(|action| *action != Action::Disconnect) {
+                let check = CheckMenuItem::with_id(id(action), action.label(), true, false, None);
+                submenu.append(&check).map_err(|e| e.to_string())?;
+                checks.push((action, check));
+            }
+            let disconnect = MenuItem::with_id(id(Action::Disconnect), Action::Disconnect.label(), true, None);
+            submenu.append_items(&[&PredefinedMenuItem::separator(), &disconnect]).map_err(|e| e.to_string())?;
+            Ok(Self { submenu, checks, shown: false })
+        }
+
+        fn update(&mut self, menu: &Menu, session: Option<&Session>) {
+            if let Some(session) = session {
+                self.submenu.set_text(session.title());
+                // Every time: clicking a check mark flips it by itself, whatever the viewer did.
+                for (action, check) in &self.checks {
+                    check.set_checked(session.toggles.get(*action));
+                }
+            }
+            if session.is_some() != self.shown {
+                let changed = if session.is_some() {
+                    menu.insert(&self.submenu, SESSION_POSITION)
+                } else {
+                    menu.remove(&self.submenu)
+                };
+                if changed.is_ok() {
+                    self.shown = session.is_some();
+                }
+            }
+        }
     }
 
     fn icon(indicator: Indicator) -> Option<Icon> {
@@ -273,15 +388,25 @@ mod imp {
             let quit = MenuItem::with_id("quit", "Quit", true, None);
             menu.append_items(&[&open, &toggle, &PredefinedMenuItem::separator(), &quit]).map_err(|e| e.to_string())?;
 
-            let mut builder = TrayIconBuilder::new().with_menu(Box::new(menu)).with_tooltip("PyroMirror");
+            let mut builder = TrayIconBuilder::new().with_menu(Box::new(menu.clone())).with_tooltip("PyroMirror");
             if let Some(icon) = icon(Indicator::Off) {
                 builder = builder.with_icon(icon);
             }
             let icon = builder.build().map_err(|e| e.to_string())?;
-            Ok(Self { icon, toggle, events, shown: (Indicator::Off, String::new(), false) })
+            Ok(Self {
+                icon,
+                menu,
+                toggle,
+                viewing: SessionMenu::new(Side::Viewer)?,
+                serving: SessionMenu::new(Side::Host)?,
+                events,
+                shown: (Indicator::Off, String::new(), false),
+            })
         }
 
-        pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool) {
+        pub fn update(&mut self, indicator: Indicator, tooltip: &str, sharing: bool, sessions: &Sessions) {
+            self.viewing.update(&self.menu, sessions.viewing.as_ref());
+            self.serving.update(&self.menu, sessions.serving.as_ref());
             if self.shown == (indicator, tooltip.to_owned(), sharing) {
                 return;
             }
@@ -306,7 +431,16 @@ mod imp {
                     let event = match event.id.0.as_str() {
                         "open" => TrayEvent::Open,
                         "toggle" => TrayEvent::ToggleSharing,
-                        _ => TrayEvent::Quit,
+                        "quit" => TrayEvent::Quit,
+                        other => {
+                            let action = [Side::Viewer, Side::Host].into_iter().find_map(|side| {
+                                Some((side, Action::parse(other.strip_prefix(prefix(side))?)?))
+                            });
+                            match action {
+                                Some((side, action)) => TrayEvent::Session(side, action),
+                                None => continue,
+                            }
+                        }
                     };
                     let _ = self.events.send(event);
                 }

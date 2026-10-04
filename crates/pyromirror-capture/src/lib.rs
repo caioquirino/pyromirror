@@ -10,6 +10,8 @@ mod input;
 mod keymap;
 #[cfg(target_os = "linux")]
 mod portal;
+#[cfg(target_os = "linux")]
+mod wlr;
 
 pub use input::InputInjector;
 
@@ -220,10 +222,17 @@ impl Capturer {
         #[cfg(target_os = "linux")]
         {
             match &self._portal {
-                portal::PortalSession::Remote(remote) => {
-                    Some(InputInjector::new(input::Backend { remote: remote.clone() }))
-                }
-                portal::PortalSession::ViewOnly(_) => None,
+                portal::PortalSession::Remote(remote) => Some(InputInjector::new(input::Backend::Portal(remote.clone()))),
+                portal::PortalSession::ViewOnly(_) => match wlr::WlrInput::connect() {
+                    Ok(wlr) => {
+                        log::info!("Using the compositor's virtual pointer and keyboard for input");
+                        Some(InputInjector::new(input::Backend::Wlr(wlr)))
+                    }
+                    Err(e) => {
+                        log::debug!("No compositor input either: {}", e);
+                        None
+                    }
+                },
             }
         }
         #[cfg(windows)]

@@ -68,3 +68,22 @@ pub fn client_state(log: &[LogLine]) -> ClientState {
     }
     state
 }
+
+/// The name of the computer the viewer is connected to.
+pub fn viewed_host(log: &[LogLine]) -> Option<String> {
+    let (_id, name) = log.iter().find_map(|l| l.text.strip_prefix("Host: "))?.split_once(' ')?;
+    Some(name.trim().to_owned()).filter(|name| !name.is_empty())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::process::parse_line;
+
+    #[test]
+    fn viewed_host_is_the_name_after_the_id() {
+        let log = [parse_line("[2026-01-01T00:00:00Z INFO  pyromirror_client] Host: 2b706206d8f0 Living room PC")];
+        assert_eq!(viewed_host(&log).as_deref(), Some("Living room PC"));
+        assert_eq!(viewed_host(&[]), None);
+    }
+}

@@ -4,6 +4,7 @@
 //! All multi-byte integers are serialized in little-endian byte order.
 
 pub mod auth;
+pub mod control;
 
 use byteorder::{ByteOrder, LittleEndian};
 use thiserror::Error;
@@ -19,6 +20,11 @@ pub const MSG_TYPE_INPUT_EVENT: u32 = 9;
 /// Server to client: the remote pointer's shape. The message payload is a [`CursorHeader`]; it is
 /// followed on the stream by `width * height * 4` bytes of straight-alpha RGBA.
 pub const MSG_TYPE_CURSOR: u32 = 10;
+/// Server to client: do something to the session (one byte, `control::Action::to_byte`). Sent
+/// when the person at the host, or the client through the session, uses the host's tray menu.
+pub const MSG_TYPE_SESSION_ACTION: u32 = 11;
+/// Client to server: what the session has switched on (one byte, `control::Toggles::to_bits`).
+pub const MSG_TYPE_SESSION_STATE: u32 = 12;
 
 /// [`CursorHeader::flags`]: the pointer is shown (not hidden by the remote desktop).
 pub const CURSOR_VISIBLE: u16 = 1 << 0;

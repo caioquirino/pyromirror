@@ -18,16 +18,17 @@ use anyhow::{bail, Context};
 use clap::Parser;
 use log::{info, warn};
 use sdl3::event::{Event, WindowEvent};
-use sdl3::keyboard::{Keycode, Mod};
+use sdl3::keyboard::{Keycode, Mod, Scancode};
 use sdl3::pixels::{Color, PixelFormat};
 use sdl3::render::FRect;
 
 use pyromirror_codec::{Chroma, Decoder, Device};
 use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
+use pyromirror_proto::control::{self, Side, Toggles};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, CursorHeader, InputEvent, VideoCodecType,
-    MSG_TYPE_CURSOR,
+    MSG_TYPE_CURSOR, MSG_TYPE_SESSION_ACTION, MSG_TYPE_SESSION_STATE,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
     MSG_TYPE_INPUT_EVENT,
 };
@@ -119,6 +120,21 @@ fn save_toolbar_position(position: f32) {
         if let Err(err) = std::fs::write(&path, format!("{position:.4}\n")) {
             warn!("Could not remember the menu position in {}: {}", path.display(), err);
         }
+    }
+}
+
+/// The session action behind a key pressed with Ctrl+Alt. Goes by what the key is without
+/// modifiers: with them, the layout may turn it into something else (Ctrl+Alt is AltGr on
+/// Windows, where "m" becomes "µ" on some layouts).
+fn hotkey(scancode: Scancode) -> Option<toolbar::Action> {
+    use toolbar::Action;
+    match Keycode::from_scancode(scancode, sdl3::sys::keycode::SDL_KMOD_NONE, false)? {
+        Keycode::F => Some(Action::Fullscreen),
+        Keycode::G => Some(Action::KeyboardGrab),
+        Keycode::L => Some(Action::MouseLock),
+        Keycode::M => Some(Action::RelativeMouse),
+        Keycode::Q => Some(Action::Disconnect),
+        _ => None,
     }
 }
 
@@ -299,9 +315,10 @@ fn main() -> anyhow::Result<()> {
     }
 
     let (cursor_tx, cursor_rx) = crossbeam_channel::unbounded::<(CursorHeader, Vec<u8>)>();
+    let (remote_action_tx, remote_action_rx) = crossbeam_channel::unbounded::<toolbar::Action>();
     {
-        // After the handshake the server only sends the pointer's shape; a failed read means it
-        // went away.
+        // After the handshake the server sends the pointer's shape, and what its tray menu asks
+        // of this session; a failed read means it went away.
         let (mut tcp, running) = (tcp.try_clone()?, running.clone());
         std::thread::spawn(move || {
             let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
@@ -314,6 +331,11 @@ fn main() -> anyhow::Result<()> {
                             break;
                         }
                         let _ = cursor_tx.send((header, image));
+                    }
+                    Ok((MSG_TYPE_SESSION_ACTION, 1)) => {
+                        if let Some(action) = toolbar::Action::from_byte(payload[0]) {
+                            let _ = remote_action_tx.send(action);
+                        }
                     }
                     Ok(_) => {}
                     Err(_) => break,
@@ -348,6 +370,11 @@ fn main() -> anyhow::Result<()> {
     let mut pointer: Option<(f32, f32)> = None;
     // A press that landed on the toolbar; its release must not reach the remote desktop either.
     let mut toolbar_press = false;
+    // Lets the tray menu switch the same things as the menu in this window.
+    let mut control = control::Listener::new(Side::Viewer);
+    // What the host was last told is switched on, for its tray menu.
+    let mut told_host: Option<Toggles> = None;
+    let mut last_control_poll = Instant::now();
 
     'main: while running.load(Ordering::Relaxed) {
         if args.exit_after.is_some_and(|secs| started.elapsed().as_secs_f64() >= secs) {
@@ -364,6 +391,14 @@ fn main() -> anyhow::Result<()> {
 
         let window_width = canvas.window().size().0 as f32;
         let stats = summary.lock().unwrap().clone();
+
+        // What the menu, the hotkeys and the tray asked for; applied after the events are read.
+        let mut pending: Vec<toolbar::Action> = Vec::new();
+        if last_control_poll.elapsed() >= Duration::from_millis(100) {
+            last_control_poll = Instant::now();
+            pending = control.poll();
+        }
+        pending.extend(remote_action_rx.try_iter());
 
         for event in event_pump.poll_iter() {
             // The toolbar gets first pick of pointer events (not in relative mode, where there
@@ -396,30 +431,7 @@ fn main() -> anyhow::Result<()> {
                 }
             }
             if toolbar_press || action.is_some() {
-                match action {
-                    Some(toolbar::Action::Fullscreen) => {
-                        fullscreen = !fullscreen;
-                        let _ = canvas.window_mut().set_fullscreen(fullscreen);
-                    }
-                    Some(toolbar::Action::KeyboardGrab) => {
-                        grab = !grab;
-                        canvas.window_mut().set_keyboard_grab(grab);
-                    }
-                    Some(toolbar::Action::MouseLock) => {
-                        mouse_lock = !mouse_lock;
-                        canvas.window_mut().set_mouse_grab(mouse_lock);
-                    }
-                    Some(toolbar::Action::RelativeMouse) => {
-                        // The pointer is gone from here on, and the menu with it.
-                        relative_mouse = true;
-                        sdl.mouse().set_relative_mouse_mode(canvas.window(), true);
-                        toolbar.notify("Relative mouse on - Ctrl+Alt+M to turn off");
-                        info!("Relative mouse: true");
-                    }
-                    Some(toolbar::Action::Mute) => muted = !muted,
-                    Some(toolbar::Action::Disconnect) => break 'main,
-                    None => {}
-                }
+                pending.extend(action);
                 redraw = true;
                 continue;
             }
@@ -430,36 +442,12 @@ fn main() -> anyhow::Result<()> {
                     redraw = true;
                     None
                 }
-                Event::KeyDown { keycode: Some(key), keymod, repeat: false, .. }
+                Event::KeyDown { scancode: Some(scancode), keymod, repeat: false, .. }
                     if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
                         && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD)
-                        && matches!(key, Keycode::G | Keycode::M | Keycode::F | Keycode::L | Keycode::Q) =>
+                        && hotkey(scancode).is_some() =>
                 {
-                    match key {
-                        Keycode::G => {
-                            grab = !grab;
-                            canvas.window_mut().set_keyboard_grab(grab);
-                            info!("Keyboard grab: {}", grab);
-                        }
-                        Keycode::M => {
-                            relative_mouse = !relative_mouse;
-                            sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
-                            toolbar.notify(if relative_mouse { "Relative mouse on - Ctrl+Alt+M to turn off" } else { "Relative mouse off" });
-                            info!("Relative mouse: {}", relative_mouse);
-                            redraw = true;
-                        }
-                        Keycode::F => {
-                            fullscreen = !fullscreen;
-                            let _ = canvas.window_mut().set_fullscreen(fullscreen);
-                        }
-                        Keycode::L => {
-                            mouse_lock = !mouse_lock;
-                            canvas.window_mut().set_mouse_grab(mouse_lock);
-                            info!("Mouse lock: {}", mouse_lock);
-                            redraw = true;
-                        }
-                        _ => break 'main,
-                    }
+                    pending.extend(hotkey(scancode));
                     None
                 }
                 Event::KeyDown { scancode: Some(scancode), keymod, repeat: false, .. } => Some(InputEvent::KeyboardKey {
@@ -488,6 +476,43 @@ fn main() -> anyhow::Result<()> {
                     warn!("Lost the control connection");
                     break 'main;
                 }
+            }
+        }
+
+        for action in pending {
+            match action {
+                toolbar::Action::Fullscreen => {
+                    fullscreen = !fullscreen;
+                    let _ = canvas.window_mut().set_fullscreen(fullscreen);
+                }
+                toolbar::Action::KeyboardGrab => {
+                    grab = !grab;
+                    canvas.window_mut().set_keyboard_grab(grab);
+                    info!("Keyboard grab: {}", grab);
+                }
+                toolbar::Action::MouseLock => {
+                    mouse_lock = !mouse_lock;
+                    canvas.window_mut().set_mouse_grab(mouse_lock);
+                    info!("Mouse lock: {}", mouse_lock);
+                }
+                toolbar::Action::RelativeMouse => {
+                    relative_mouse = !relative_mouse;
+                    sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
+                    info!("Relative mouse: {}", relative_mouse);
+                }
+                toolbar::Action::Mute => muted = !muted,
+                toolbar::Action::Disconnect => break 'main,
+            }
+            redraw = true;
+        }
+        redraw |= toolbar.set_relative(relative_mouse);
+        let toggles = Toggles { fullscreen, keyboard_grab: grab, mouse_lock, relative_mouse, muted };
+        control.publish(toggles);
+        if told_host != Some(toggles) {
+            told_host = Some(toggles);
+            if write_message(&mut tcp, MSG_TYPE_SESSION_STATE, &[toggles.to_bits()]).is_err() {
+                warn!("Lost the control connection");
+                break 'main;
             }
         }
 
@@ -542,14 +567,8 @@ fn main() -> anyhow::Result<()> {
             if have_frame {
                 canvas.copy(&texture, None, Some(dst))?;
             }
-            toolbar.draw(&mut canvas, window_width, &stats, |action| match action {
-                toolbar::Action::Fullscreen => fullscreen,
-                toolbar::Action::KeyboardGrab => grab,
-                toolbar::Action::MouseLock => mouse_lock,
-                toolbar::Action::RelativeMouse => relative_mouse,
-                toolbar::Action::Mute => muted,
-                toolbar::Action::Disconnect => false,
-            });
+            let toggles = Toggles { fullscreen, keyboard_grab: grab, mouse_lock, relative_mouse, muted };
+            toolbar.draw(&mut canvas, window_width, &stats, |action| toggles.get(action));
             canvas.present();
             redraw = false;
         }

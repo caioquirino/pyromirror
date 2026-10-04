@@ -12,7 +12,9 @@
     <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
              Description="PyroMirror $(var.Version)"
              Comments="Low-latency remote desktop for local networks" />
-    <MajorUpgrade DowngradeErrorMessage="A newer version of PyroMirror is already installed." />
+    <!-- Pre-releases share one MSI version (0.1.0-beta.5 and -beta.6 are both 0.1.0), so an equal
+         version has to be replaced too, or the old files stay. -->
+    <MajorUpgrade AllowSameVersionUpgrades="yes" DowngradeErrorMessage="A newer version of PyroMirror is already installed." />
     <Media Id="1" Cabinet="pyromirror.cab" EmbedCab="yes" />
 
     <!-- Shown in "Installed apps"; the shortcut takes its icon from pyromirror.exe itself. -->

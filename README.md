@@ -88,6 +88,10 @@ To stop, close the window or use **Disconnect**. On the shared computer, **Stop 
 
 Move the pointer to the top edge of the remote desktop window and a small handle appears. Click it for the session menu: fullscreen, keyboard grab, mouse lock, relative mouse, mute, disconnect, and the live frame rate and bitrate. If the handle sits where you need the edge (scrolling the map in a strategy game, say), drag it sideways; it stays where you leave it, in later sessions too.
 
+While PyroMirror's tray icon is running, its right-click menu has the same options under "*name* session" for as long as you are connected. The tray icon on the remote computer has that menu too, so the options stay within reach through the session itself, whatever state the window on your side is in.
+
+Relative mouse (for games that steer with the mouse) takes the pointer away, and the menu with it. A small note at the top edge shows the way out, `Ctrl + Alt + M`, for as long as it is on; the tray menu works too.
+
 | Keys | Action |
 | :--- | :--- |
 | `Ctrl + Alt + F` | Fullscreen |
@@ -154,7 +158,7 @@ On Windows, remote input cannot reach administrator windows or UAC prompts.
 
 - **A GPU with Vulkan 1.3** and current drivers, on both computers.
 - **A fast local network.** Wired Ethernet is what it is designed for.
-- **Linux:** PipeWire, and on the computer being shared a desktop portal with remote-desktop support (GNOME and KDE have one; wlroots desktops can share the screen but not accept input).
+- **Linux:** PipeWire, and on the computer being shared a desktop portal for screen sharing. Mouse and keyboard go through the portal on GNOME and KDE, and through the virtual pointer and keyboard protocols on wlroots desktops (Sway, Hyprland, labwc).
 - **Windows 10 or 11.**
 
 ## What is missing

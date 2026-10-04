@@ -8,7 +8,7 @@ mod source;
 
 use std::io::Write;
 use std::net::{IpAddr, Shutdown, SocketAddr, TcpListener, TcpStream, UdpSocket};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -21,12 +21,17 @@ use pyromirror_capture::{CaptureOptions, Capturer, InputInjector};
 use pyromirror_codec::{Chroma, Device, Encoder, Packets};
 use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
+use pyromirror_proto::control::{Listener, Side, Toggles};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent,
     CursorHeader, VideoCodecType, VideoColorProfile, CURSOR_IN_VIDEO, CURSOR_VISIBLE, MAX_CURSOR_SIDE,
     MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS, MSG_TYPE_CURSOR, MSG_TYPE_INPUT_EVENT,
+    MSG_TYPE_SESSION_ACTION, MSG_TYPE_SESSION_STATE,
 };
 use source::{Source, SourceFrame, TestPattern};
+
+/// No toggle state has arrived from the client; not a valid `Toggles` bit pattern.
+const TOGGLES_UNKNOWN: u8 = u8::MAX;
 
 /// How often an unchanged desktop is re-sent, so a client that lost packets converges to a clean
 /// image and a freshly connected one gets a picture immediately.
@@ -405,6 +410,8 @@ fn serve_client(
     let (injector, mtu, pace_mbps) = (injector.as_ref(), *mtu, *pace_mbps);
     let audio_socket = udp.try_clone()?;
     let (running, target) = (&running, &target);
+    // What the client's session has switched on, once it has said so (older clients never do).
+    let client_toggles = &AtomicU8::new(TOGGLES_UNKNOWN);
 
     std::thread::scope(|scope| {
         // Control channel: input events, and the signal that the client went away.
@@ -428,6 +435,7 @@ fn serve_client(
                         }
                         Err(e) => debug!("Undecodable input event: {}", e),
                     },
+                    Ok((MSG_TYPE_SESSION_STATE, 1)) => client_toggles.store(payload[0], Ordering::Relaxed),
                     Ok((other, _)) => debug!("Ignoring control message type {}", other),
                     Err(_) => break,
                 }
@@ -498,6 +506,7 @@ fn serve_client(
             target,
             running,
             pace_mbps,
+            client_toggles,
         );
         running.store(false, Ordering::Relaxed);
         let _ = tcp.shutdown(Shutdown::Both);
@@ -558,7 +567,12 @@ fn stream_video(
     target: &Mutex<SocketAddr>,
     running: &AtomicBool,
     pace_mbps: u32,
+    client_toggles: &AtomicU8,
 ) -> anyhow::Result<()> {
+    // The tray menu on this computer can steer the client's session; that is the way out for
+    // someone who is stuck inside it, since this desktop is what they can still reach.
+    let mut session = Listener::new(Side::Host);
+    let mut last_session_poll = Instant::now();
     // The pointer is not part of the picture: its shape goes to the viewer, which draws it
     // itself. `None` makes the first check send whatever is known.
     let mut cursor_serial: Option<u64> = None;
@@ -599,6 +613,19 @@ fn stream_video(
             cursor_serial = Some(cursor.serial);
             if let Err(e) = send_cursor(&mut control, &cursor, source.scale()) {
                 debug!("Could not send the pointer shape: {}", e);
+            }
+        }
+        match client_toggles.load(Ordering::Relaxed) {
+            TOGGLES_UNKNOWN => {}
+            bits => session.publish(Toggles::from_bits(bits)),
+        }
+        if last_session_poll.elapsed() >= Duration::from_millis(100) {
+            last_session_poll = Instant::now();
+            for action in session.poll() {
+                info!("Tray menu: {} for the client", action.label());
+                if let Err(e) = write_message(&mut control, MSG_TYPE_SESSION_ACTION, &[action.to_byte()]) {
+                    debug!("Could not send a session action: {}", e);
+                }
             }
         }
         stats.report();
