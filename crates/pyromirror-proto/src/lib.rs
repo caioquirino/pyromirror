@@ -3,6 +3,8 @@
 //! Binary network protocol designed for ultra-low latency remote desktop streaming.
 //! All multi-byte integers are serialized in little-endian byte order.
 
+pub mod auth;
+
 use byteorder::{ByteOrder, LittleEndian};
 use thiserror::Error;
 

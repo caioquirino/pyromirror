@@ -3,13 +3,14 @@
 //! Receives PyroWave packets over UDP, decodes them on the GPU and shows the result in an SDL3
 //! window. Mouse and keyboard events go back to the server over the TCP control connection.
 
+mod toolbar;
 mod video;
 
 use std::io::Read;
 use std::net::{Shutdown, SocketAddr, TcpStream, ToSocketAddrs};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context};
@@ -22,6 +23,7 @@ use sdl3::render::FRect;
 
 use pyromirror_codec::{Chroma, Decoder, Device};
 use pyromirror_net::{create_streaming_socket, UDP_PUNCH};
+use pyromirror_proto::auth::{self, AuthChallenge, AuthMethod, AuthResponse, AuthResult, TokenStore};
 use pyromirror_proto::{
     read_message, write_message, AudioCodecType, ClientHello, CodecParameters, InputEvent, VideoCodecType,
     VideoColorProfile, MAX_MESSAGE_PAYLOAD, MSG_TYPE_CLIENT_HELLO, MSG_TYPE_CODEC_PARAMS,
@@ -46,6 +48,14 @@ struct Args {
     #[arg(short, long)]
     fullscreen: bool,
 
+    /// Pairing code shown by the host; only needed the first time you connect to it
+    #[arg(long, value_name = "CODE")]
+    pairing_code: Option<String>,
+
+    /// Keep the mouse pointer inside the viewer window (toggle with Ctrl+Alt+L)
+    #[arg(long)]
+    lock_mouse: bool,
+
     /// Local UDP port to receive video on (0 lets the OS pick)
     #[arg(long, default_value_t = 0)]
     local_port: u16,
@@ -57,6 +67,10 @@ struct Args {
     /// Exit after this many seconds (for automated testing)
     #[arg(long, hide = true)]
     exit_after: Option<f64>,
+
+    /// Write what the window shows to this BMP file on exit (for automated testing)
+    #[arg(long, hide = true)]
+    dump_window: Option<PathBuf>,
 
     /// Write the most recent frame to this file as a PPM image on exit (for automated testing)
     #[arg(long, hide = true)]
@@ -109,24 +123,72 @@ fn main() -> anyhow::Result<()> {
     udp.set_read_timeout(Some(Duration::from_millis(50)))?;
     let local_udp_port = udp.local_addr()?.port();
 
-    // 2. Handshake over TCP.
-    info!("Connecting to {}", server_addr);
-    let mut tcp = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))
-        .with_context(|| format!("could not connect to {}", server_addr))?;
-    tcp.set_nodelay(true)?;
+    // 2. Handshake over TCP: hello, pairing, stream description.
+    let config_dir = auth::config_dir().unwrap_or_else(std::env::temp_dir);
+    let client_id = auth::local_id(&config_dir.join("client-id"));
+    let mut hosts = TokenStore::load(config_dir.join("paired-hosts"));
+    let code = args.pairing_code.as_deref().map(auth::normalize_code).filter(|c| !c.is_empty());
 
-    let mut hello = [0u8; ClientHello::SIZE];
-    ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
-    write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
+    // A host that has forgotten us rejects our token; with a code at hand, pair again.
+    let mut use_token = true;
+    let (mut tcp, params) = loop {
+        info!("Connecting to {}", server_addr);
+        let mut tcp = TcpStream::connect_timeout(&server_addr, Duration::from_secs(5))
+            .with_context(|| format!("could not connect to {}", server_addr))?;
+        tcp.set_nodelay(true)?;
+        tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
 
-    tcp.set_read_timeout(Some(Duration::from_secs(10)))?;
-    let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
-    let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no reply from the server")?;
-    if msg_type != MSG_TYPE_CODEC_PARAMS {
-        bail!("unexpected handshake reply (message type {})", msg_type);
-    }
-    let params = CodecParameters::deserialize(&payload[..len])?;
-    tcp.set_read_timeout(None)?;
+        let mut hello = [0u8; ClientHello::SIZE];
+        ClientHello { udp_port: local_udp_port, flags: 0 }.serialize(&mut hello)?;
+        write_message(&mut tcp, MSG_TYPE_CLIENT_HELLO, &hello)?;
+
+        let mut payload = [0u8; MAX_MESSAGE_PAYLOAD];
+        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no reply from the server")?;
+        if msg_type != auth::MSG_TYPE_AUTH_CHALLENGE {
+            bail!("unexpected handshake reply (message type {}); is the host running an older version?", msg_type);
+        }
+        let challenge = AuthChallenge::deserialize(&payload[..len])?;
+
+        let token = hosts.get(&challenge.server_id).filter(|_| use_token);
+        let (method, mac) = match (challenge.required, token, &code) {
+            (false, ..) => (AuthMethod::None, [0u8; 32]),
+            (true, Some(token), _) => (AuthMethod::Token, auth::token_proof(token, &challenge, &client_id)),
+            (true, None, Some(code)) => (AuthMethod::Code, auth::code_proof(code, &challenge, &client_id)),
+            (true, None, None) => bail!("this host asks for a pairing code: enter the code it shows"),
+        };
+        write_message(&mut tcp, auth::MSG_TYPE_AUTH_RESPONSE, &AuthResponse { method, client_id, mac }.serialize())?;
+
+        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no pairing result from the server")?;
+        if msg_type != auth::MSG_TYPE_AUTH_RESULT || len < 1 {
+            bail!("unexpected pairing reply (message type {})", msg_type);
+        }
+        match (AuthResult::from_byte(payload[0]), method, &code) {
+            (AuthResult::Ok, AuthMethod::Code, Some(code)) => {
+                let token = auth::derive_token(code, &challenge, &client_id);
+                match hosts.insert(challenge.server_id, token) {
+                    Ok(()) => info!("Paired with this host; the code will not be needed again"),
+                    Err(e) => warn!("Could not save the pairing; the code will be needed again: {}", e),
+                }
+            }
+            (AuthResult::Ok, ..) => {}
+            (AuthResult::WrongCode, ..) => bail!("wrong pairing code"),
+            (AuthResult::NotPaired, AuthMethod::Token, Some(_)) => {
+                use_token = false;
+                continue;
+            }
+            (AuthResult::NotPaired, ..) => {
+                bail!("this host no longer recognises this computer: enter the pairing code it shows")
+            }
+        }
+
+        let (msg_type, len) = read_message(&mut tcp, &mut payload).context("no stream description from the server")?;
+        if msg_type != MSG_TYPE_CODEC_PARAMS {
+            bail!("unexpected handshake reply (message type {})", msg_type);
+        }
+        let params = CodecParameters::deserialize(&payload[..len])?;
+        tcp.set_read_timeout(None)?;
+        break (tcp, params);
+    };
 
     if params.video_codec != VideoCodecType::PyroWave {
         bail!("server offers {:?}, this client only decodes PyroWave", params.video_codec);
@@ -211,11 +273,12 @@ fn main() -> anyhow::Result<()> {
     let (frame_tx, frame_rx) = crossbeam_channel::bounded::<Vec<u8>>(2);
     let (recycle_tx, recycle_rx) = crossbeam_channel::bounded::<Vec<u8>>(4);
 
+    let summary = Arc::new(Mutex::new(String::new()));
     let video_thread = {
-        let (udp, running) = (udp.try_clone()?, running.clone());
+        let (udp, running, summary) = (udp.try_clone()?, running.clone(), summary.clone());
         std::thread::Builder::new()
             .name("video".into())
-            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, running))?
+            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, summary, running))?
     };
 
     {
@@ -242,7 +305,8 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 6. Event and presentation loop.
-    info!("Ctrl+Alt+G: grab keyboard | Ctrl+Alt+M: relative mouse | Ctrl+Alt+F: fullscreen | Ctrl+Alt+Q: quit");
+    info!("Move the pointer to the top edge of the window for the toolbar");
+    info!("Ctrl+Alt+G: grab keyboard | Ctrl+Alt+L: lock mouse | Ctrl+Alt+M: relative mouse | Ctrl+Alt+F: fullscreen | Ctrl+Alt+Q: quit");
     let mut event_pump = sdl.event_pump()?;
     let started = Instant::now();
     let mut grab = false;
@@ -251,6 +315,17 @@ fn main() -> anyhow::Result<()> {
     let mut have_frame = false;
     let mut last_frame: Option<Vec<u8>> = None;
     let mut redraw = true;
+    let mut muted = false;
+    // Confines the pointer to the window so it cannot slip onto another monitor or the local
+    // taskbar; takes effect while the window has focus.
+    let mut mouse_lock = args.lock_mouse;
+    if mouse_lock {
+        canvas.window_mut().set_mouse_grab(true);
+    }
+    let mut toolbar = toolbar::Toolbar::new();
+    let mut pointer: Option<(f32, f32)> = None;
+    // A press that landed on the toolbar; its release must not reach the remote desktop either.
+    let mut toolbar_press = false;
 
     'main: while running.load(Ordering::Relaxed) {
         if args.exit_after.is_some_and(|secs| started.elapsed().as_secs_f64() >= secs) {
@@ -265,7 +340,55 @@ fn main() -> anyhow::Result<()> {
             (sx as u16, sy as u16)
         };
 
+        let window_width = canvas.window().size().0 as f32;
+        let stats = summary.lock().unwrap().clone();
+
         for event in event_pump.poll_iter() {
+            // The toolbar gets first pick of pointer events (not in relative mode, where there
+            // is no pointer position to speak of).
+            let mut action = None;
+            match &event {
+                Event::MouseMotion { x, y, .. } => pointer = Some((*x, *y)),
+                Event::Window { win_event: WindowEvent::MouseLeave, .. } => pointer = None,
+                _ => {}
+            }
+            if !relative_mouse {
+                match &event {
+                    Event::MouseMotion { x, y, .. } if toolbar.captures((*x, *y), window_width, &stats) => continue,
+                    Event::MouseButtonDown { x, y, .. } if toolbar.captures((*x, *y), window_width, &stats) => {
+                        toolbar_press = true;
+                        action = toolbar.click((*x, *y), window_width, &stats);
+                    }
+                    Event::MouseButtonUp { .. } if toolbar_press => {
+                        toolbar_press = false;
+                        continue;
+                    }
+                    Event::MouseWheel { .. } if pointer.is_some_and(|p| toolbar.captures(p, window_width, &stats)) => continue,
+                    _ => {}
+                }
+            }
+            if toolbar_press || action.is_some() {
+                match action {
+                    Some(toolbar::Action::Fullscreen) => {
+                        fullscreen = !fullscreen;
+                        let _ = canvas.window_mut().set_fullscreen(fullscreen);
+                    }
+                    Some(toolbar::Action::KeyboardGrab) => {
+                        grab = !grab;
+                        canvas.window_mut().set_keyboard_grab(grab);
+                    }
+                    Some(toolbar::Action::MouseLock) => {
+                        mouse_lock = !mouse_lock;
+                        canvas.window_mut().set_mouse_grab(mouse_lock);
+                    }
+                    Some(toolbar::Action::Mute) => muted = !muted,
+                    Some(toolbar::Action::Disconnect) => break 'main,
+                    None => {}
+                }
+                redraw = true;
+                continue;
+            }
+
             let input = match event {
                 Event::Quit { .. } => break 'main,
                 Event::Window { win_event: WindowEvent::Exposed | WindowEvent::Resized(..) | WindowEvent::PixelSizeChanged(..), .. } => {
@@ -275,7 +398,7 @@ fn main() -> anyhow::Result<()> {
                 Event::KeyDown { keycode: Some(key), keymod, repeat: false, .. }
                     if keymod.intersects(Mod::LCTRLMOD | Mod::RCTRLMOD)
                         && keymod.intersects(Mod::LALTMOD | Mod::RALTMOD)
-                        && matches!(key, Keycode::G | Keycode::M | Keycode::F | Keycode::Q) =>
+                        && matches!(key, Keycode::G | Keycode::M | Keycode::F | Keycode::L | Keycode::Q) =>
                 {
                     match key {
                         Keycode::G => {
@@ -291,6 +414,12 @@ fn main() -> anyhow::Result<()> {
                         Keycode::F => {
                             fullscreen = !fullscreen;
                             let _ = canvas.window_mut().set_fullscreen(fullscreen);
+                        }
+                        Keycode::L => {
+                            mouse_lock = !mouse_lock;
+                            canvas.window_mut().set_mouse_grab(mouse_lock);
+                            info!("Mouse lock: {}", mouse_lock);
+                            redraw = true;
                         }
                         _ => break 'main,
                     }
@@ -327,6 +456,10 @@ fn main() -> anyhow::Result<()> {
 
         if let Some(stream) = &audio_stream {
             for pcm in audio_rx.try_iter() {
+                if muted {
+                    let _ = stream.clear();
+                    continue;
+                }
                 let queued = stream.queued_bytes().unwrap_or(0);
                 if queued > audio_max_queued {
                     let _ = stream.clear();
@@ -352,15 +485,44 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
+        if toolbar.update(if relative_mouse { None } else { pointer }, window_width, &stats) {
+            redraw = true;
+        }
+
         if redraw {
             canvas.set_draw_color(if have_frame { Color::RGB(0, 0, 0) } else { Color::RGB(18, 24, 38) });
             canvas.clear();
             if have_frame {
                 canvas.copy(&texture, None, Some(dst))?;
             }
+            toolbar.draw(&mut canvas, window_width, &stats, |action| match action {
+                toolbar::Action::Fullscreen => fullscreen,
+                toolbar::Action::KeyboardGrab => grab,
+                toolbar::Action::MouseLock => mouse_lock,
+                toolbar::Action::Mute => muted,
+                toolbar::Action::Disconnect => false,
+            });
             canvas.present();
             redraw = false;
         }
+    }
+
+    if let Some(path) = &args.dump_window {
+        // Redraw into the back buffer and read it before it is presented.
+        canvas.set_draw_color(Color::RGB(0, 0, 0));
+        canvas.clear();
+        let dst = letterbox(canvas.window().size(), (width, height));
+        if have_frame {
+            canvas.copy(&texture, None, Some(dst))?;
+        }
+        let window_width = canvas.window().size().0 as f32;
+        let stats = summary.lock().unwrap().clone();
+        toolbar.draw(&mut canvas, window_width, &stats, |action| match action {
+            toolbar::Action::MouseLock => mouse_lock,
+            toolbar::Action::Mute => muted,
+            _ => false,
+        });
+        canvas.read_pixels(None)?.save_bmp(path)?;
     }
 
     running.store(false, Ordering::Relaxed);

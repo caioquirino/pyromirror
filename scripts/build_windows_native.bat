@@ -28,6 +28,7 @@ if errorlevel 1 exit /b 1
 
 echo.
 echo Build complete! Windows release binaries in target\release:
+echo   - pyromirror.exe            (launcher)
 echo   - pyromirror-server.exe
 echo   - pyromirror-client.exe
 echo   - libpyrowave-shared-0.dll  (must stay next to the executables)

@@ -2,3 +2,7 @@
 # make the Linux binaries look for it there.
 [target.'cfg(target_os = "linux")']
 rustflags = ["-C", "link-arg=-Wl,-rpath,$ORIGIN"]
+
+# MinGW builds (cross-compiled from Linux).
+[target.x86_64-pc-windows-gnu]
+linker = "x86_64-w64-mingw32-gcc"

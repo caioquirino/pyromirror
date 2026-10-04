@@ -9,13 +9,14 @@ members = [
     "crates/pyromirror-audio",
     "crates/pyromirror-server",
     "crates/pyromirror-client",
+    "crates/pyromirror-gui",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 authors = ["PyroMirror Contributors"]
-license = "MIT"
+license = "Apache-2.0"
 repository = "https://github.com/caioquirino/pyromirror"
 
 [workspace.dependencies]

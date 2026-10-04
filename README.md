@@ -22,6 +22,7 @@ Not implemented yet:
 
 * **Zero-copy capture.** Frames take a CPU round trip (colour conversion + upload) on both ends; the D3D11 shared-texture / DMA-BUF paths of PyroWave are not wired up yet.
 * **HDR.** With HDR enabled on Windows the capture is an SDR conversion that looks washed out.
+* **Encryption.** Pairing controls who may connect, but video, audio and input travel unencrypted.
 * **Mouse pointer on Windows** (Desktop Duplication delivers it separately; the viewer's own pointer shows the position), **gamepads**, **clipboard**, **FEC**, **resolution changes while streaming**, and the **Android client**.
 
 ---
@@ -138,6 +139,7 @@ cargo build --release
 The first build clones the Granite revision PyroWave is pinned to (into `submodules/pyrowave/Granite`, so it needs `git` and network access) and compiles PyroWave with CMake. `libpyrowave-shared` is copied next to the binaries; keep it there when moving them elsewhere.
 
 Binaries will be placed in `target/release/`:
+* `pyromirror`: The launcher window. Pick **Connect** or **Share**, adjust the settings, press the button; it starts the two programs below for you and remembers your settings.
 * `pyromirror-server`: The streaming host (screen capture, encoder).
 * `pyromirror-client`: The viewer (SDL3 window, decoder, input capture).
 
@@ -163,7 +165,7 @@ Ready-to-use scripts are located in `scripts/`:
   ```bash
   ./scripts/build_windows_cross.sh
   ```
-  Produces `pyromirror-server.exe`, `pyromirror-client.exe` and the DLLs they need in `target/x86_64-pc-windows-gnu/release/`; copy that set of files to the Windows machine.
+  Produces a self-contained folder, `dist/windows-x86_64/` (the three programs plus `libpyrowave-shared-0.dll`); copy that folder to the Windows machine.
 
 * **Windows x86_64 (Native MSVC on Windows machine):**
   ```cmd
@@ -178,6 +180,10 @@ Ready-to-use scripts are located in `scripts/`:
 ---
 
 ## Running PyroMirror
+
+The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) on both computers, press **Share this computer** on the host, and enter the address it shows in the **Connect** tab on the other one. It looks and works the same on Windows and Linux. The command-line programs it drives are described below.
+
+While connected, move the pointer to the top edge of the viewer for a toolbar with fullscreen, keyboard grab, mouse lock, mute, disconnect and live frame rate / bitrate.
 
 ### 1. Starting the Host (Server)
 
@@ -198,6 +204,8 @@ cargo run --release --bin pyromirror-server -- \
 * `--mtu <BYTES>`: UDP datagram size (default: `1400` for standard Ethernet; `8900` for jumbo frames).
 * `--scale <N>`: Shrink the picture by an integer factor before encoding (default: `1`; `2` turns a 4K desktop into a 1080p stream).
 * `--pace-factor <X>`: Release datagrams at X times the bitrate (default: `2`). Lower values, down to `1.1`, smooth out bursts on Wi-Fi at the cost of a few milliseconds of latency.
+* `--pairing-code <CODE>`: Use this pairing code instead of a random one (see Pairing below).
+* `--no-pairing`: Let anyone who can reach the port connect.
 * `--no-audio`: Do not capture or send audio.
 * `--no-input`: Ignore the client's mouse and keyboard (view-only).
 * `--monitor <INDEX>`: Windows only, monitor to capture (default: primary). On Linux the portal dialog picks the monitor.
@@ -211,6 +219,12 @@ On Windows, input cannot reach elevated (administrator) windows or UAC prompts u
 
 On Windows, allow the server through the firewall when prompted (TCP and UDP on the chosen port).
 
+#### Pairing
+
+The server prints a 6-digit pairing code when it starts (the launcher shows it while sharing is on). A computer connecting for the first time must supply it: type it into the launcher's Connect tab, or pass `--pairing-code` to the client. After that the two machines remember each other and no code is needed, even if addresses change. Pairings are stored in `%APPDATA%\pyromirror` / `~/.config/pyromirror` (`paired-clients` on the host, `paired-hosts` on the viewer); delete those files to forget them.
+
+Pairing keeps strangers from connecting. It does not encrypt anything: the stream and your keystrokes are still readable by others on the same network, and someone recording a first-time pairing could work out the code. Pair on a network you trust.
+
 ### 2. Starting the Client (Viewer)
 
 ```bash
@@ -221,6 +235,7 @@ cargo run --release --bin pyromirror-client -- pyro://192.168.1.100:9000
 #### Viewer Controls:
 * **`Ctrl + Alt + G`**: Toggle keyboard grab (so `Alt+Tab`, `Super` etc. reach the viewer).
 * **`Ctrl + Alt + F`**: Toggle fullscreen.
+* **`Ctrl + Alt + L`**: Toggle mouse lock (keeps the pointer inside the viewer window; also `--lock-mouse`).
 * **`Ctrl + Alt + M`**: Toggle relative mouse mode.
 * **`Ctrl + Alt + Q`**: Quit.
 
@@ -286,8 +301,24 @@ cargo ndk -t arm64-v8a -o ./android/app/src/main/jniLibs build --release -p pyro
 
 ---
 
+## Code Signing Policy
+
+Windows releases are intended to be signed through [SignPath](https://signpath.io): free code signing provided by SignPath.io, certificate by SignPath Foundation. *(Application pending; until it is accepted, releases are unsigned.)*
+
+* **What is signed:** only the files produced by the [release workflow](.github/workflows/release.yml) from the source in this repository: `pyromirror.exe`, `pyromirror-server.exe`, `pyromirror-client.exe` and `libpyrowave-shared-0.dll` (PyroWave, built from its pinned source). No prebuilt third-party binaries are included.
+* **Committers and reviewers:** [Caio Quirino](https://github.com/caioquirino)
+* **Approvers:** [Caio Quirino](https://github.com/caioquirino). Every signing request is approved manually.
+
+### Privacy
+
+PyroMirror does not collect or transmit any data to its authors or to third parties. It only communicates with the computers you connect it to: the screen contents, audio and input of a session travel directly between the two machines. Settings and pairing data are stored locally (`%APPDATA%\pyromirror` or `~/.config/pyromirror`).
+
+---
+
 ## License
 
-* **PyroMirror:** MIT License.
-* **PyroWave:** MIT License (Copyright (c) Hans-Kristian Arntzen).
-* **Granite:** Apache-2.0 / MIT.
+PyroMirror is licensed under the [Apache License 2.0](LICENSE). Third-party components and their licenses are listed in [NOTICE](NOTICE); the main ones:
+
+* **PyroWave** and **Granite:** MIT License (Copyright (c) Hans-Kristian Arntzen).
+* **SDL3:** zlib License.
+* **egui:** MIT or Apache-2.0.

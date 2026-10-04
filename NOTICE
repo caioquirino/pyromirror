@@ -1,0 +1,20 @@
+PyroMirror
+Copyright 2026 Caio Quirino and the PyroMirror contributors
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This product includes software developed by third parties:
+
+- PyroWave (https://github.com/Themaister/pyrowave)
+  Copyright (c) Hans-Kristian Arntzen. MIT License.
+- Granite (https://github.com/Themaister/Granite), built as part of PyroWave
+  Copyright (c) Hans-Kristian Arntzen. MIT License.
+- SDL3 (https://libsdl.org)
+  Copyright (C) Sam Lantinga. zlib License.
+- egui / eframe (https://github.com/emilk/egui)
+  MIT License or Apache License 2.0.
+- Rust crates listed in Cargo.lock, under their respective licenses
+  (predominantly MIT and/or Apache-2.0).
+- When built with MinGW, the executables statically link the GCC runtime libraries
+  (libstdc++, libgcc, winpthreads), which are distributed under the GPL with the GCC Runtime
+  Library Exception and the MinGW-w64 runtime license.

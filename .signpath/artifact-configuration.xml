@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  What SignPath signs in the artifact uploaded by .github/workflows/release.yml (GitHub
+  hands it over as a zip). Paste this into the project's artifact configuration in SignPath.
+  Every file listed here is built from source by that workflow.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <pe-file-set>
+      <include path="pyromirror.exe" />
+      <include path="pyromirror-server.exe" />
+      <include path="pyromirror-client.exe" />
+      <include path="libpyrowave-shared-0.dll" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </pe-file-set>
+  </zip-file>
+</artifact-configuration>

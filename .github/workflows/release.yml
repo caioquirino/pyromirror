@@ -1,0 +1,209 @@
+# Manual release: Actions -> Release -> Run workflow, and enter the version (e.g. 1.2.3).
+#
+# It builds Windows and Linux from the selected branch with that version, and only if both
+# succeed commits the version bump, tags it v<version> and publishes a GitHub release with the
+# two archives and their checksums.
+#
+# Windows code signing (optional). Once SignPath has accepted the project, set in the repository
+# settings:
+#   secret   SIGNPATH_API_TOKEN          API token of the SignPath CI user
+#   variable SIGNPATH_ORGANIZATION_ID    organization id from the SignPath dashboard
+#   variable SIGNPATH_PROJECT_SLUG       e.g. "pyromirror"
+#   variable SIGNPATH_SIGNING_POLICY     e.g. "release-signing"
+# Without them the Windows archive is published unsigned.
+name: Release
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release, without the leading v (e.g. 1.2.3 or 1.2.3-beta.1)"
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+env:
+  VERSION: ${{ inputs.version }}
+  TAG: v${{ inputs.version }}
+
+jobs:
+  check:
+    name: Check the version
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - name: Validate
+        run: |
+          # set_version.sh rejects anything that is not a semantic version.
+          ./scripts/set_version.sh "$VERSION"
+          if git rev-parse -q --verify "refs/tags/$TAG" > /dev/null; then
+            echo "::error::Tag $TAG already exists"
+            exit 1
+          fi
+
+  windows:
+    name: Build Windows (cross-compiled)
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      # Only PyroWave is needed to build; PyroFling is reference material.
+      - name: Fetch PyroWave
+        run: git submodule update --init submodules/pyrowave
+
+      - name: Install the MinGW toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y mingw-w64 cmake ninja-build
+          # std::mutex and std::thread need the POSIX threading flavour of MinGW.
+          sudo update-alternatives --set x86_64-w64-mingw32-gcc /usr/bin/x86_64-w64-mingw32-gcc-posix
+          sudo update-alternatives --set x86_64-w64-mingw32-g++ /usr/bin/x86_64-w64-mingw32-g++-posix
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add x86_64-pc-windows-gnu
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set the version
+        run: ./scripts/set_version.sh "$VERSION"
+
+      - name: Build
+        run: ./scripts/build_windows_cross.sh
+
+      # SignPath takes its input from a GitHub artifact, so the unsigned files are uploaded first.
+      - name: Upload unsigned files
+        id: unsigned
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-unsigned
+          path: dist/windows-x86_64/
+          if-no-files-found: error
+
+      - name: Sign with SignPath
+        if: vars.SIGNPATH_ORGANIZATION_ID != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY }}
+          github-artifact-id: ${{ steps.unsigned.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: dist/windows-signed
+
+      - name: Package
+        run: |
+          SOURCE=dist/windows-x86_64
+          if [ -d dist/windows-signed ]; then SOURCE=dist/windows-signed; fi
+          NAME="pyromirror-$VERSION-windows-x86_64"
+          mkdir -p "package/$NAME"
+          cp -r "$SOURCE"/. "package/$NAME/"
+          (cd package && zip -r "../$NAME.zip" "$NAME")
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows-package
+          path: pyromirror-*.zip
+          if-no-files-found: error
+
+  linux:
+    name: Build Linux
+    needs: check
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch PyroWave
+        run: git submodule update --init submodules/pyrowave
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # PipeWire for capture and audio; the rest is what SDL3 needs to be built with Wayland,
+          # X11 and audio support, since Ubuntu 24.04 has no SDL3 package.
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libpipewire-0.3-dev libspa-0.2-dev \
+            libwayland-dev wayland-protocols libxkbcommon-dev libdecor-0-dev \
+            libegl1-mesa-dev libgles2-mesa-dev libgl1-mesa-dev libdrm-dev libgbm-dev \
+            libx11-dev libxext-dev libxrandr-dev libxcursor-dev libxi-dev libxfixes-dev \
+            libxss-dev libxtst-dev libxinerama-dev \
+            libpulse-dev libasound2-dev libdbus-1-dev libudev-dev
+
+      - name: Install Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Set the version
+        run: ./scripts/set_version.sh "$VERSION"
+
+      - name: Test
+        run: cargo test --workspace --features pyromirror-client/bundled-sdl
+
+      - name: Build
+        run: ./scripts/build_linux_x86_64.sh --bundled-sdl
+
+      - name: Package
+        run: |
+          NAME="pyromirror-$VERSION-linux-x86_64"
+          mkdir -p "package/$NAME"
+          cp -r dist/linux-x86_64/. "package/$NAME/"
+          tar -C package -czf "$NAME.tar.gz" "$NAME"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-package
+          path: pyromirror-*.tar.gz
+          if-no-files-found: error
+
+  publish:
+    name: Tag and publish
+    needs: [windows, linux]
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Commit the version and tag it
+        run: |
+          ./scripts/set_version.sh "$VERSION"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Nothing to commit if the version was already set by hand.
+          git commit -am "Release $TAG" || true
+          git tag -a "$TAG" -m "PyroMirror $VERSION"
+          # Fails, leaving nothing half-published, if the branch moved while building.
+          git push --atomic origin "HEAD:${GITHUB_REF_NAME}" "$TAG"
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: "*-package"
+          merge-multiple: true
+          path: release
+
+      - name: Create the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cd release
+          sha256sum pyromirror-* > SHA256SUMS
+          # A version with a hyphen (1.2.3-beta.1) is a pre-release.
+          FLAGS=()
+          if [[ "$VERSION" == *-* ]]; then FLAGS+=(--prerelease); fi
+          gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "PyroMirror $VERSION" \
+            --generate-notes --verify-tag "${FLAGS[@]}" pyromirror-* SHA256SUMS

@@ -2,7 +2,7 @@
 
 use std::net::UdpSocket;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender, TrySendError};
@@ -34,6 +34,7 @@ pub fn receive_loop(
     frames: Sender<Vec<u8>>,
     recycled: Receiver<Vec<u8>>,
     audio: Option<Sender<Vec<i16>>>,
+    summary: Arc<Mutex<String>>,
     running: Arc<AtomicBool>,
 ) {
     let stride = width as usize * 4;
@@ -134,6 +135,12 @@ pub fn receive_loop(
 
         let elapsed = last_report.elapsed();
         if elapsed >= Duration::from_secs(2) {
+            // Shown in the viewer's toolbar.
+            *summary.lock().unwrap() = format!(
+                "{:.0} fps {:.0} Mbps",
+                stats.frames as f64 / elapsed.as_secs_f64(),
+                stats.bytes as f64 * 8.0 / 1e6 / elapsed.as_secs_f64()
+            );
             if stats.frames > 0 || stats.skipped > 0 {
                 let log_degraded = stats.partial > 0 || stats.skipped > 0;
                 let message = format!(

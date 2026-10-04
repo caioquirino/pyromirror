@@ -7,3 +7,6 @@ license.workspace = true
 [dependencies]
 byteorder = { workspace = true }
 thiserror = { workspace = true }
+hmac = "0.12"
+sha2 = "0.10"
+getrandom = "0.3"
