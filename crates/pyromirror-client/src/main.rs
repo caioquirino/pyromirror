@@ -119,6 +119,26 @@ fn send_input(tcp: &mut TcpStream, event: InputEvent) -> bool {
 
 /// Largest rectangle with the stream's aspect ratio that fits the window, centred.
 /// Where the session menu's handle was last dragged to, kept between sessions.
+/// Relative mouse motion arrives in fractions of a pixel and is sent in whole ones. What does
+/// not fit is kept for the next event, so that slow movements are not lost.
+#[derive(Default)]
+struct RelativeMotion {
+    x: f32,
+    y: f32,
+}
+
+impl RelativeMotion {
+    /// The whole pixels to send for a movement, if it adds up to any.
+    fn take(&mut self, dx: f32, dy: f32) -> Option<(i16, i16)> {
+        self.x += dx;
+        self.y += dy;
+        let (whole_x, whole_y) = (self.x.trunc(), self.y.trunc());
+        self.x -= whole_x;
+        self.y -= whole_y;
+        (whole_x != 0.0 || whole_y != 0.0).then_some((whole_x as i16, whole_y as i16))
+    }
+}
+
 fn toolbar_position_file() -> Option<PathBuf> {
     Some(pyromirror_proto::auth::config_dir()?.join("viewer-menu"))
 }
@@ -155,7 +175,12 @@ impl ShowStats {
         }
         if self.frames > 0 {
             let per_frame = |total: Duration| total.as_secs_f64() * 1000.0 / self.frames as f64;
-            log::debug!("per frame: {:.2} ms upload + {:.2} ms present", per_frame(self.upload), per_frame(self.present));
+            log::debug!(
+                "{:.1} fps shown; per frame: {:.2} ms upload + {:.2} ms present",
+                self.frames as f64 / since.elapsed().as_secs_f64(),
+                per_frame(self.upload),
+                per_frame(self.present)
+            );
         }
         *self = Self { since: Some(Instant::now()), ..Default::default() };
     }
@@ -384,12 +409,20 @@ fn main() -> anyhow::Result<()> {
 
     let summary = Arc::new(Mutex::new(String::new()));
     let stalled = Arc::new(std::sync::atomic::AtomicU32::new(0));
+    // Pushed by the video thread to wake the event loop below when a frame is ready.
+    let events = sdl.event()?;
+    let frame_ready = unsafe { events.register_event()? };
     let video_thread = {
         let (udp, running, summary, stalled) = (udp.try_clone()?, running.clone(), summary.clone(), stalled.clone());
+        let sender = events.event_sender();
+        let wake = move || {
+            let null = std::ptr::null_mut();
+            let _ = sender.push_event(Event::User { timestamp: 0, window_id: 0, type_: frame_ready, code: 0, data1: null, data2: null });
+        };
         let largest_carried = args.drop_datagrams_over.unwrap_or(usize::MAX);
         std::thread::Builder::new()
             .name("video".into())
-            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, recycle_rx, audio_tx, summary, stalled, largest_carried, running))?
+            .spawn(move || video::receive_loop(udp, decoder, width, height, frame_tx, wake, recycle_rx, audio_tx, summary, stalled, largest_carried, running))?
     };
 
     {
@@ -443,6 +476,7 @@ fn main() -> anyhow::Result<()> {
     let started = Instant::now();
     let mut grab = false;
     let mut relative_mouse = false;
+    let mut relative_motion = RelativeMotion::default();
     let mut fullscreen = args.fullscreen;
     let mut have_frame = false;
     let mut last_frame: Option<Vec<u8>> = None;
@@ -501,7 +535,11 @@ fn main() -> anyhow::Result<()> {
         }
         pending.extend(remote_action_rx.try_iter());
 
-        for event in event_pump.poll_iter() {
+        // Sleeps until there is something to do: input goes out the moment it arrives, and the
+        // video thread wakes this one when a frame is ready. The timeout paces the loop while
+        // neither happens.
+        let woken_by = event_pump.wait_event_timeout(Duration::from_millis(4));
+        for event in woken_by.into_iter().chain(event_pump.poll_iter()) {
             // The toolbar gets first pick of pointer events (not in relative mode, where there
             // is no pointer position to speak of).
             let mut action = None;
@@ -561,12 +599,13 @@ fn main() -> anyhow::Result<()> {
                     down: false,
                     modifiers: keymod.bits(),
                 }),
-                Event::MouseMotion { x, y, xrel, yrel, .. } => Some(if relative_mouse {
-                    InputEvent::MouseMoveRelative { dx: xrel as i16, dy: yrel as i16 }
-                } else {
+                Event::MouseMotion { xrel, yrel, .. } if relative_mouse => {
+                    relative_motion.take(xrel, yrel).map(|(dx, dy)| InputEvent::MouseMoveRelative { dx, dy })
+                }
+                Event::MouseMotion { x, y, .. } => {
                     let (x, y) = to_stream(x, y);
-                    InputEvent::MouseMoveAbsolute { x, y }
-                }),
+                    Some(InputEvent::MouseMoveAbsolute { x, y })
+                }
                 Event::MouseButtonDown { mouse_btn, .. } => Some(InputEvent::MouseButton { button: mouse_btn as u8, down: true }),
                 Event::MouseButtonUp { mouse_btn, .. } => Some(InputEvent::MouseButton { button: mouse_btn as u8, down: false }),
                 Event::MouseWheel { x, y, .. } => Some(InputEvent::MouseWheel { dx: (x * 120.0) as i16, dy: (y * 120.0) as i16 }),
@@ -598,6 +637,7 @@ fn main() -> anyhow::Result<()> {
                 }
                 toolbar::Action::RelativeMouse => {
                     relative_mouse = !relative_mouse;
+                    relative_motion = RelativeMotion::default();
                     sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
                     info!("Relative mouse: {}", relative_mouse);
                 }
@@ -634,8 +674,7 @@ fn main() -> anyhow::Result<()> {
             }
         }
 
-        // Wait briefly for the next frame; this also paces the loop while the stream is idle.
-        if let Ok(mut frame) = frame_rx.recv_timeout(Duration::from_millis(4)) {
+        if let Ok(mut frame) = frame_rx.try_recv() {
             // Only the newest frame is worth showing.
             while let Ok(newer) = frame_rx.try_recv() {
                 if let video::Frame::Pixels(old) = std::mem::replace(&mut frame, newer) {
@@ -737,4 +776,19 @@ fn main() -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slow_relative_motion_adds_up_instead_of_getting_lost() {
+        let mut motion = RelativeMotion::default();
+        let sent: Vec<_> = (0..10).filter_map(|_| motion.take(0.3, -0.25)).collect();
+        assert_eq!(sent.iter().map(|m| m.0 as i32).sum::<i32>(), 3);
+        assert_eq!(sent.iter().map(|m| m.1 as i32).sum::<i32>(), -2);
+        assert_eq!(motion.take(2.5, 0.0), Some((2, 0)));
+        assert_eq!(motion.take(0.1, 0.0), None);
+    }
 }

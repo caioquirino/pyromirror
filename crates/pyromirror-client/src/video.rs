@@ -48,6 +48,8 @@ pub fn receive_loop(
     width: u32,
     height: u32,
     frames: Sender<Frame>,
+    // Called after a frame was handed over, to wake the thread that shows it.
+    wake: impl Fn(),
     recycled: Receiver<Vec<u8>>,
     audio: Option<Sender<Vec<i16>>>,
     summary: Arc<Mutex<String>>,
@@ -110,7 +112,8 @@ pub fn receive_loop(
         }
 
         match frames.try_send(frame) {
-            Ok(()) | Err(TrySendError::Full(_)) => {}
+            Ok(()) => wake(),
+            Err(TrySendError::Full(_)) => {}
             Err(TrySendError::Disconnected(_)) => running.store(false, Ordering::Relaxed),
         }
     };
