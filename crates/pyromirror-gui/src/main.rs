@@ -41,8 +41,40 @@ const GREEN: Color32 = Color32::from_rgb(0x3e, 0xcf, 0x8e);
 const YELLOW: Color32 = Color32::from_rgb(0xf2, 0xc1, 0x4e);
 const RED: Color32 = Color32::from_rgb(0xf0, 0x5d, 0x5e);
 
+const HELP: &str = "\
+Remote desktop: share this computer, or connect to another one.
+
+Usage: pyromirror [OPTION]
+
+Without an option, opens the PyroMirror window.
+
+Options:
+      --background  Run in the tray without a window; this is what starts at login
+  -h, --help        Print help
+  -V, --version     Print version";
+
 fn main() -> eframe::Result {
-    env_logger::init_from_env(env_logger::Env::default().default_filter_or("info"));
+    // Answered before anything is started or touched.
+    for arg in std::env::args().skip(1) {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                println!("PyroMirror {}\n{}", env!("CARGO_PKG_VERSION"), HELP);
+                return Ok(());
+            }
+            "-V" | "--version" => {
+                println!("pyromirror {}", env!("CARGO_PKG_VERSION"));
+                return Ok(());
+            }
+            _ => {}
+        }
+    }
+
+    // The D-Bus library logs its own workings at info level, and warns about portal objects
+    // that are gone by the time it looks; neither is ours to report.
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
+        .filter_module("zbus", log::LevelFilter::Error)
+        .filter_module("tracing", log::LevelFilter::Error)
+        .init();
 
     // `--screenshot <file> [host|connect]` renders one frame to a PPM image and exits; it exists
     // so the look of the window can be checked without a person in front of it.
