@@ -5,6 +5,7 @@
 //! wavelet blocks of one frame, and the next frame replaces it anyway.
 
 use std::net::SocketAddr;
+use std::sync::mpsc::{channel, sync_channel, Receiver, SyncSender};
 use std::time::{Duration, Instant};
 
 use pyromirror_proto::{
@@ -12,6 +13,7 @@ use pyromirror_proto::{
     PAYLOAD_PACKET_SEQ_BITS, PAYLOAD_PACKET_SEQ_MASK, PAYLOAD_PACKET_SEQ_OFFSET,
     PAYLOAD_STREAM_TYPE_BIT, PAYLOAD_SUBPACKET_SEQ_MASK, PAYLOAD_SUBPACKET_SEQ_OFFSET,
 };
+use log::warn;
 use socket2::{Domain, Protocol, Socket, Type};
 use thiserror::Error;
 
@@ -201,6 +203,73 @@ impl FrameSender {
     }
 }
 
+/// One encoded frame, copied out of the encoder.
+struct QueuedFrame {
+    bytes: Vec<u8>,
+    /// Where each packet starts in `bytes`, and where the last one ends.
+    bounds: Vec<usize>,
+    pts: u64,
+    target: SocketAddr,
+}
+
+/// Sends frames from a thread of its own, so that the next frame can be captured and encoded
+/// while the pacer is still letting the previous one out.
+///
+/// Nothing queues up: handing over a frame waits until the previous one is on the wire, which
+/// holds the stream back to what the pace allows instead of letting frames grow old in a queue.
+pub struct FrameQueue {
+    frames: Option<SyncSender<QueuedFrame>>,
+    spare: Receiver<(Vec<u8>, Vec<usize>)>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FrameQueue {
+    pub fn new(mut sender: FrameSender) -> std::io::Result<Self> {
+        let (frames, queued) = sync_channel::<QueuedFrame>(0);
+        let (recycle, spare) = channel();
+        let thread = std::thread::Builder::new().name("video-send".into()).spawn(move || {
+            for frame in queued {
+                sender.set_target_addr(frame.target);
+                let packets = frame.bounds.windows(2).map(|bound| &frame.bytes[bound[0]..bound[1]]);
+                // A full send buffer or a transient ICMP error only costs this frame.
+                if let Err(e) = sender.send_frame(packets, frame.pts) {
+                    warn!("Dropped a frame: {}", e);
+                }
+                let _ = recycle.send((frame.bytes, frame.bounds));
+            }
+        })?;
+        Ok(Self { frames: Some(frames), spare, thread: Some(thread) })
+    }
+
+    /// Hands the packets of one encoded frame to the sending thread, to go to `target`. Returns
+    /// the number of bytes they take on the wire.
+    pub fn send_frame<'a>(&mut self, packets: impl Iterator<Item = &'a [u8]>, pts: u64, target: SocketAddr) -> usize {
+        let (mut bytes, mut bounds) = self.spare.try_recv().unwrap_or_default();
+        bytes.clear();
+        bounds.clear();
+        bounds.push(0);
+        for packet in packets {
+            bytes.extend_from_slice(packet);
+            bounds.push(bytes.len());
+        }
+        let on_wire = bytes.len() + (bounds.len() - 1) * PAYLOAD_HEADER_SIZE;
+        if let Some(frames) = &self.frames {
+            let _ = frames.send(QueuedFrame { bytes, bounds, pts, target });
+        }
+        on_wire
+    }
+}
+
+impl Drop for FrameQueue {
+    fn drop(&mut self) {
+        // Closing the channel ends the thread, after the frame it is busy with.
+        self.frames = None;
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
 /// One received video datagram.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VideoPacket<'a> {
@@ -354,6 +423,34 @@ mod tests {
             received.extend(packet.payload.chunks_exact(2).map(|b| i16::from_le_bytes([b[0], b[1]])));
         }
         assert_eq!(received, samples);
+    }
+
+    #[test]
+    fn queued_frames_arrive_whole_and_in_order() {
+        let rx = create_streaming_socket("127.0.0.1:0".parse().unwrap(), 1 << 20).unwrap();
+        let tx = create_streaming_socket("127.0.0.1:0".parse().unwrap(), 1 << 20).unwrap();
+        rx.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
+        let target = rx.local_addr().unwrap();
+        let mut queue = FrameQueue::new(FrameSender::new(tx, target, 100)).unwrap();
+
+        let frames: [&[&[u8]]; 3] = [&[b"one", b"two"], &[b"three"], &[b"four", b"five", b"six"]];
+        for (pts, packets) in frames.iter().enumerate() {
+            let payload: usize = packets.iter().map(|p| p.len()).sum();
+            let on_wire = queue.send_frame(packets.iter().copied(), pts as u64, target);
+            assert_eq!(on_wire, payload + packets.len() * PAYLOAD_HEADER_SIZE);
+        }
+        drop(queue);
+
+        let mut buf = [0u8; 128];
+        for (frame_seq, packets) in frames.iter().enumerate() {
+            for (index, expected) in packets.iter().enumerate() {
+                let (len, _) = rx.recv_from(&mut buf).unwrap();
+                let packet = parse_video_datagram(&buf[..len]).unwrap();
+                assert_eq!((packet.frame_seq, packet.index, packet.pts), (frame_seq as u32, index as u32, frame_seq as u64));
+                assert_eq!(packet.payload, *expected);
+                assert_eq!(packet.last, index == packets.len() - 1);
+            }
+        }
     }
 
     #[test]

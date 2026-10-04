@@ -54,6 +54,12 @@ impl Source {
         self.scale
     }
 
+    /// Whether frames come at a rate of the source's own choosing, which may be more than the
+    /// stream wants. The test pattern makes exactly as many as it is asked for.
+    pub fn sets_its_own_rate(&self) -> bool {
+        matches!(self.kind, Kind::Capture(_))
+    }
+
     /// Asks for frames to stay on the GPU. False where the source cannot do that.
     pub fn set_gpu_frames(&mut self, enable: bool) -> bool {
         match &mut self.kind {
@@ -132,12 +138,14 @@ pub struct TestPattern {
     width: u32,
     height: u32,
     frame: u64,
+    /// When the next picture is due.
+    next_at: Instant,
     pixels: Vec<u8>,
 }
 
 impl TestPattern {
     pub fn new(width: u32, height: u32) -> Self {
-        let mut pattern = Self { width, height, frame: 0, pixels: vec![0; width as usize * height as usize * 4] };
+        let mut pattern = Self { width, height, frame: 0, next_at: Instant::now(), pixels: vec![0; width as usize * height as usize * 4] };
         pattern.render();
         pattern
     }
@@ -156,9 +164,12 @@ impl TestPattern {
         }
     }
 
-    fn next_frame(&mut self, _timeout: Duration) -> SourceFrame<'_> {
+    /// A new picture every `interval`, like a desktop that refreshes at the stream's rate.
+    fn next_frame(&mut self, interval: Duration) -> SourceFrame<'_> {
         self.frame += 1;
         self.render();
+        pyromirror_net::sleep_until(self.next_at);
+        self.next_at = (self.next_at + interval).max(Instant::now());
         SourceFrame {
             data: &self.pixels,
             width: self.width,

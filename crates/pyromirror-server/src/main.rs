@@ -19,7 +19,7 @@ use log::{debug, error, info, trace, warn};
 use pyromirror_audio::AudioCapture;
 use pyromirror_capture::{CaptureOptions, Capturer, DmaBuf, DmaBufModifiers, InputInjector};
 use pyromirror_codec::{Chroma, Device, DmaBufPlanes, Encoder, Packets, TextureHandle};
-use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameSender, UDP_PUNCH};
+use pyromirror_net::{create_streaming_socket, packet_boundary, sleep_until, AudioSender, FrameQueue, FrameSender, UDP_PUNCH};
 use pyromirror_proto::auth::{self, TokenStore};
 use pyromirror_proto::control::{Listener, Side, Toggles};
 use pyromirror_proto::{
@@ -750,20 +750,24 @@ fn stream_video(
     // The pointer is not part of the picture: its shape goes to the viewer, which draws it
     // itself. `None` makes the first check send whatever is known.
     let mut cursor_serial: Option<u64> = None;
-    let mut sender = FrameSender::new(socket, *target.lock().unwrap(), pace_mbps);
+    // Frames go out from a thread of their own, while this one gets on with the next.
+    let mut sender = FrameQueue::new(FrameSender::new(socket, *target.lock().unwrap(), pace_mbps))?;
 
     let start = Instant::now();
     let mut last_sent: Option<Instant> = None;
     let mut stats = Stats::default();
 
-    let mut next_frame_at = Instant::now();
+    // Frames are sent as the desktop delivers them. Waiting for a tick of our own instead would
+    // send each one up to a frame late, and repeat or skip one whenever the two clocks drift
+    // past each other. This only holds back a desktop that is faster than the stream is meant
+    // to be; the slack keeps one that runs at just about the same rate from being held back.
+    let min_interval = frame_interval - frame_interval / 8;
+    let mut next_frame_from = Instant::now();
 
     // Time for the client to notice that a change helped before it is asked again.
     let mut shrunk_at: Option<Instant> = None;
 
     while running.load(Ordering::Relaxed) {
-        sender.set_target_addr(*target.lock().unwrap());
-
         if datagrams_lost.swap(0, Ordering::Relaxed) > 0 && shrunk_at.map_or(true, |t| t.elapsed() >= Duration::from_secs(3)) {
             match smaller_datagrams(*mtu) {
                 Some(smaller) => {
@@ -781,7 +785,14 @@ fn stream_video(
         }
         let packet_boundary = *packet_boundary_now;
 
+        if source.sets_its_own_rate() {
+            sleep_until(next_frame_from);
+        }
         let frame = source.next_frame(frame_interval)?;
+        if let Some(frame) = &frame {
+            // Counted from when the desktop delivered it, not from when it was copied.
+            next_frame_from = Instant::now() - frame.prepare + min_interval;
+        }
         let encode_start = Instant::now();
         // Borrow of `source` by the frame ends with the encode below; the pointer is checked
         // after it.
@@ -806,11 +817,8 @@ fn stream_video(
         if let Some(packets) = packets {
             let encode_time = encode_start.elapsed();
             let pts = start.elapsed().as_micros() as u64;
-            match sender.send_frame(packets.iter(), pts) {
-                Ok(bytes) => stats.frame(bytes, prepare, encode_time, on_gpu),
-                // A full send buffer or a transient ICMP error only costs this frame.
-                Err(e) => warn!("Dropped a frame: {}", e),
-            }
+            let bytes = sender.send_frame(packets.iter(), pts, *target.lock().unwrap());
+            stats.frame(bytes, prepare, encode_time, on_gpu);
             last_sent = Some(Instant::now());
         }
         if let Some(cursor) = source.cursor(cursor_serial) {
@@ -833,11 +841,6 @@ fn stream_video(
             }
         }
         stats.report();
-
-        // Cap the frame rate; the capture backend may deliver faster than requested. If we are
-        // running behind, do not try to catch up with a burst.
-        next_frame_at = (next_frame_at + frame_interval).max(Instant::now());
-        sleep_until(next_frame_at);
     }
     Ok(())
 }
