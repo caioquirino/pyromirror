@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=PyroMirror
+GenericName=Remote Desktop
+Comment=Low-latency remote desktop for local networks
+Exec=pyromirror
+Icon=pyromirror
+Terminal=false
+Categories=Network;RemoteAccess;
+Keywords=remote;desktop;screen;share;stream;
+StartupWMClass=pyromirror

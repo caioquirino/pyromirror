@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Signs the MSI installer itself (the files inside it are signed beforehand through
+  artifact-configuration.xml). Create a second artifact configuration in SignPath with this
+  content and put its slug into the SIGNPATH_MSI_CONFIGURATION repository variable.
+-->
+<artifact-configuration xmlns="http://signpath.io/artifact-configuration/v1">
+  <zip-file>
+    <msi-file-set>
+      <include path="*.msi" />
+      <for-each>
+        <authenticode-sign />
+      </for-each>
+    </msi-file-set>
+  </zip-file>
+</artifact-configuration>

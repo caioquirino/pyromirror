@@ -1,8 +1,9 @@
 # Manual release: Actions -> Release -> Run workflow, and enter the version (e.g. 1.2.3).
 #
-# It builds Windows and Linux from the selected branch with that version, and only if both
-# succeed commits the version bump, tags it v<version> and publishes a GitHub release with the
-# two archives and their checksums.
+# It builds and packages Windows and Linux from the selected branch with that version, and only
+# if both succeed commits the version bump, tags it v<version> and publishes a GitHub release
+# with: a Windows zip and MSI installer, a Linux tarball, .deb, .rpm and Arch packages, the AUR
+# recipe (PKGBUILD) and checksums.
 #
 # Windows code signing (optional). Once SignPath has accepted the project, set in the repository
 # settings:
@@ -10,7 +11,9 @@
 #   variable SIGNPATH_ORGANIZATION_ID    organization id from the SignPath dashboard
 #   variable SIGNPATH_PROJECT_SLUG       e.g. "pyromirror"
 #   variable SIGNPATH_SIGNING_POLICY     e.g. "release-signing"
-# Without them the Windows archive is published unsigned.
+#   variable SIGNPATH_MSI_CONFIGURATION  (optional) slug of an artifact configuration that signs
+#                                        the MSI itself, see .signpath/
+# Without them the Windows files are published unsigned.
 name: Release
 
 on:
@@ -20,6 +23,10 @@ on:
         description: "Version to release, without the leading v (e.g. 1.2.3 or 1.2.3-beta.1)"
         required: true
         type: string
+      publish:
+        description: "Tag and publish the release (untick to only build and package, as a test)"
+        type: boolean
+        default: true
 
 permissions:
   contents: read
@@ -59,7 +66,7 @@ jobs:
     steps:
       - name: Install the toolchain
         run: |
-          pacman -Syu --noconfirm --needed base-devel git cmake ninja zip rustup mingw-w64-gcc
+          pacman -Syu --noconfirm --needed base-devel git cmake ninja zip rustup mingw-w64-gcc msitools
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add x86_64-pc-windows-gnu
@@ -101,19 +108,43 @@ jobs:
           wait-for-completion: true
           output-artifact-directory: dist/windows-signed
 
-      - name: Package
+      - name: Package (zip and MSI)
         run: |
           SOURCE=dist/windows-x86_64
           if [ -d dist/windows-signed ]; then SOURCE=dist/windows-signed; fi
           NAME="pyromirror-$VERSION-windows-x86_64"
-          mkdir -p "package/$NAME"
+          mkdir -p "package/$NAME" out
           cp -r "$SOURCE"/. "package/$NAME/"
-          (cd package && zip -r "../$NAME.zip" "$NAME")
+          (cd package && zip -r "../out/$NAME.zip" "$NAME")
+          ./scripts/package_windows.sh "$VERSION" "$SOURCE" "out/$NAME.msi"
+
+      # The installer needs its own signature, on top of the files inside it.
+      - name: Upload unsigned installer
+        if: vars.SIGNPATH_MSI_CONFIGURATION != ''
+        id: unsigned-msi
+        uses: actions/upload-artifact@v4
+        with:
+          name: windows-msi-unsigned
+          path: out/*.msi
+          if-no-files-found: error
+
+      - name: Sign the installer with SignPath
+        if: vars.SIGNPATH_MSI_CONFIGURATION != ''
+        uses: signpath/github-action-submit-signing-request@v1
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: ${{ vars.SIGNPATH_PROJECT_SLUG }}
+          signing-policy-slug: ${{ vars.SIGNPATH_SIGNING_POLICY }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_MSI_CONFIGURATION }}
+          github-artifact-id: ${{ steps.unsigned-msi.outputs.artifact-id }}
+          wait-for-completion: true
+          output-artifact-directory: out
 
       - uses: actions/upload-artifact@v4
         with:
           name: windows-package
-          path: pyromirror-*.zip
+          path: out/
           if-no-files-found: error
 
   linux:
@@ -155,22 +186,34 @@ jobs:
       - name: Build
         run: ./scripts/build_linux_x86_64.sh --bundled-sdl
 
-      - name: Package
+      - name: Install nfpm
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download --repo goreleaser/nfpm --pattern '*Linux_x86_64.tar.gz' --dir "$RUNNER_TEMP/nfpm"
+          tar -xzf "$RUNNER_TEMP"/nfpm/*.tar.gz -C "$RUNNER_TEMP/nfpm" nfpm
+          echo "$RUNNER_TEMP/nfpm" >> "$GITHUB_PATH"
+
+      - name: Package (tarball, .deb, .rpm, Arch, AUR recipe)
         run: |
           NAME="pyromirror-$VERSION-linux-x86_64"
           mkdir -p "package/$NAME"
           cp -r dist/linux-x86_64/. "package/$NAME/"
           tar -C package -czf "$NAME.tar.gz" "$NAME"
+          # Reads the tarball to put its checksum into the AUR recipe.
+          ./scripts/package_linux.sh "$VERSION"
+          mv "$NAME.tar.gz" dist/packages/
 
       - uses: actions/upload-artifact@v4
         with:
           name: linux-package
-          path: pyromirror-*.tar.gz
+          path: dist/packages/
           if-no-files-found: error
 
   publish:
     name: Tag and publish
     needs: [windows, linux]
+    if: inputs.publish
     runs-on: ubuntu-24.04
     permissions:
       contents: write
@@ -199,9 +242,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cd release
-          sha256sum pyromirror-* > SHA256SUMS
+          sha256sum * > SHA256SUMS
           # A version with a hyphen (1.2.3-beta.1) is a pre-release.
           FLAGS=()
           if [[ "$VERSION" == *-* ]]; then FLAGS+=(--prerelease); fi
           gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "PyroMirror $VERSION" \
-            --generate-notes --verify-tag "${FLAGS[@]}" pyromirror-* SHA256SUMS
+            --generate-notes --verify-tag "${FLAGS[@]}" *

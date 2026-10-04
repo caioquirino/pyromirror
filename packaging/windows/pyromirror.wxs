@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  Windows installer, built with wixl (msitools) by scripts/package_windows.sh:
+    wixl -a x64 -D Version=1.2.3 -D SourceDir=dist/windows-x86_64 ...
+  Installs into Program Files\PyroMirror with a Start menu shortcut for the launcher. A newer
+  version replaces an older one (same UpgradeCode).
+-->
+<Wix xmlns="http://schemas.microsoft.com/wix/2006/wi">
+  <Product Id="*" Name="PyroMirror" Language="1033" Version="$(var.Version)"
+           Manufacturer="PyroMirror contributors"
+           UpgradeCode="8c0f1b9e-6b0a-4a55-9a3e-2f6f3c1d7a41">
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+             Description="PyroMirror $(var.Version)"
+             Comments="Low-latency remote desktop for local networks" />
+    <MajorUpgrade DowngradeErrorMessage="A newer version of PyroMirror is already installed." />
+    <Media Id="1" Cabinet="pyromirror.cab" EmbedCab="yes" />
+
+    <Property Id="ARPURLINFOABOUT" Value="https://github.com/caioquirino/pyromirror" />
+
+    <Directory Id="TARGETDIR" Name="SourceDir">
+      <Directory Id="ProgramFiles64Folder">
+        <Directory Id="INSTALLDIR" Name="PyroMirror">
+          <Component Id="Launcher" Guid="5d0b7c1e-3d57-4a44-8f0b-6a8a9f0f2b11" Win64="yes">
+            <File Id="LauncherExe" Name="pyromirror.exe" Source="$(var.SourceDir)/pyromirror.exe" KeyPath="yes">
+              <Shortcut Id="StartMenuShortcut" Directory="ProgramMenuFolder" Name="PyroMirror"
+                        Description="Remote desktop for local networks"
+                        WorkingDirectory="INSTALLDIR" Advertise="no" />
+            </File>
+          </Component>
+          <Component Id="Server" Guid="a1f4e0a2-64a7-4d3c-9d8e-0d2b5b6f9c22" Win64="yes">
+            <File Id="ServerExe" Name="pyromirror-server.exe" Source="$(var.SourceDir)/pyromirror-server.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="Client" Guid="c7b2d9f3-1e6b-4f0a-8a57-3b9e4d7c1a33" Win64="yes">
+            <File Id="ClientExe" Name="pyromirror-client.exe" Source="$(var.SourceDir)/pyromirror-client.exe" KeyPath="yes" />
+          </Component>
+          <Component Id="Codec" Guid="e38a6c54-9f2d-4b71-b6c0-7a1d2e5f8b44" Win64="yes">
+            <File Id="PyroWaveDll" Name="libpyrowave-shared-0.dll" Source="$(var.SourceDir)/libpyrowave-shared-0.dll" KeyPath="yes" />
+          </Component>
+          <Component Id="Documents" Guid="f94b7d65-0a3e-4c82-a7d1-8b2e3f6a9c55" Win64="yes">
+            <File Id="LicenseTxt" Name="LICENSE.txt" Source="$(var.SourceDir)/LICENSE" KeyPath="yes" />
+            <File Id="NoticeTxt" Name="NOTICE.txt" Source="$(var.SourceDir)/NOTICE" />
+          </Component>
+        </Directory>
+      </Directory>
+      <Directory Id="ProgramMenuFolder" />
+    </Directory>
+
+    <Feature Id="Main" Title="PyroMirror" Level="1">
+      <ComponentRef Id="Launcher" />
+      <ComponentRef Id="Server" />
+      <ComponentRef Id="Client" />
+      <ComponentRef Id="Codec" />
+      <ComponentRef Id="Documents" />
+    </Feature>
+  </Product>
+</Wix>

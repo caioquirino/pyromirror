@@ -1,0 +1,73 @@
+# Builds the .deb, .rpm and Arch packages from dist/linux-x86_64 (see scripts/package_linux.sh).
+# The programs are installed together in /usr/lib/pyromirror, because they look for each other
+# and for the PyroWave library next to themselves; /usr/bin only holds links.
+name: pyromirror
+arch: amd64
+platform: linux
+version: ${VERSION}
+version_schema: semver
+release: 1
+section: net
+priority: optional
+maintainer: Caio Quirino <caioquirino@users.noreply.github.com>
+homepage: https://github.com/caioquirino/pyromirror
+license: Apache-2.0
+description: |
+  Low-latency remote desktop for local networks.
+  PyroMirror streams a desktop between two computers with the PyroWave
+  GPU wavelet codec. It includes a launcher, the host and the viewer.
+
+contents:
+  - src: dist/linux-x86_64/pyromirror
+    dst: /usr/lib/pyromirror/pyromirror
+  - src: dist/linux-x86_64/pyromirror-server
+    dst: /usr/lib/pyromirror/pyromirror-server
+  - src: dist/linux-x86_64/pyromirror-client
+    dst: /usr/lib/pyromirror/pyromirror-client
+  - src: dist/linux-x86_64/libpyrowave-shared.so.0
+    dst: /usr/lib/pyromirror/libpyrowave-shared.so.0
+  - src: /usr/lib/pyromirror/pyromirror
+    dst: /usr/bin/pyromirror
+    type: symlink
+  - src: /usr/lib/pyromirror/pyromirror-server
+    dst: /usr/bin/pyromirror-server
+    type: symlink
+  - src: /usr/lib/pyromirror/pyromirror-client
+    dst: /usr/bin/pyromirror-client
+    type: symlink
+  - src: packaging/linux/pyromirror.desktop
+    dst: /usr/share/applications/pyromirror.desktop
+  - src: packaging/linux/pyromirror.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/pyromirror.svg
+  - src: LICENSE
+    dst: /usr/share/licenses/pyromirror/LICENSE
+  - src: NOTICE
+    dst: /usr/share/licenses/pyromirror/NOTICE
+
+# Runtime needs: PipeWire (capture and audio), a Vulkan loader (codec), the desktop portal
+# (screen sharing and input on the host), and EGL/xkbcommon for the launcher window.
+overrides:
+  deb:
+    depends:
+      - libpipewire-0.3-0t64 | libpipewire-0.3-0
+      - libvulkan1
+      - libegl1
+      - libxkbcommon0
+    recommends:
+      - xdg-desktop-portal
+      - pipewire
+  rpm:
+    depends:
+      - pipewire-libs
+      - vulkan-loader
+      - libglvnd-egl
+      - libxkbcommon
+    recommends:
+      - xdg-desktop-portal
+  archlinux:
+    depends:
+      - libpipewire
+      - vulkan-icd-loader
+      - libglvnd
+      - libxkbcommon
+      - xdg-desktop-portal
