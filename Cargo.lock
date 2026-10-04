@@ -2949,7 +2949,7 @@ checksum = "d55d956fa96f5ec02be2e13af0e20391a5aa83d6a074e3ad368959d0fab299ea"
 
 [[package]]
 name = "pyromirror-audio"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "cc",
  "cpal",
@@ -2960,7 +2960,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-capture"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "ashpd",
  "cc",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-client"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2988,7 +2988,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-codec"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "pyrowave-sys",
  "thiserror 1.0.69",
@@ -2996,7 +2996,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-gui"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "eframe",
  "env_logger",
@@ -3011,7 +3011,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-net"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "log",
  "pyromirror-proto",
@@ -3021,7 +3021,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-proto"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "byteorder",
  "getrandom 0.3.4",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "pyromirror-server"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3048,7 +3048,7 @@ dependencies = [
 
 [[package]]
 name = "pyrowave-sys"
-version = "0.1.0-beta.1"
+version = "0.1.0-beta.2"
 dependencies = [
  "cmake",
 ]
