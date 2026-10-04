@@ -544,7 +544,7 @@ impl App {
         ui.add_space(4.0);
         card(ui, |ui| {
             section(ui, "While connected");
-            ui.label(RichText::new("Move the pointer to the top edge of the picture for the toolbar.").color(MUTED));
+            ui.label(RichText::new("Move the pointer to the top edge of the picture and click the handle for the menu. Drag the handle sideways if it is in the way.").color(MUTED));
             egui::Grid::new("shortcuts").num_columns(2).spacing([16.0, 4.0]).show(ui, |ui| {
                 for (keys, what) in [
                     ("Ctrl + Alt + F", "Fullscreen"),
@@ -852,7 +852,7 @@ impl App {
             ui.checkbox(&mut self.config.fullscreen, "Start in fullscreen");
             ui.checkbox(&mut self.config.lock_mouse, "Keep the mouse inside the window");
             ui.checkbox(&mut self.config.play_audio, "Play the other computer's sound");
-            ui.label(RichText::new("Used from the next connection. All three can also be switched from the toolbar while connected.").color(MUTED).small());
+            ui.label(RichText::new("Used from the next connection. All three can also be switched from the menu while connected.").color(MUTED).small());
         });
 
     }

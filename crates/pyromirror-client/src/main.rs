@@ -102,6 +102,26 @@ fn send_input(tcp: &mut TcpStream, event: InputEvent) -> bool {
 }
 
 /// Largest rectangle with the stream's aspect ratio that fits the window, centred.
+/// Where the session menu's handle was last dragged to, kept between sessions.
+fn toolbar_position_file() -> Option<PathBuf> {
+    Some(pyromirror_proto::auth::config_dir()?.join("viewer-menu"))
+}
+
+fn load_toolbar_position() -> f32 {
+    toolbar_position_file()
+        .and_then(|path| std::fs::read_to_string(path).ok())
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0.5)
+}
+
+fn save_toolbar_position(position: f32) {
+    if let Some(path) = toolbar_position_file() {
+        if let Err(err) = std::fs::write(&path, format!("{position:.4}\n")) {
+            warn!("Could not remember the menu position in {}: {}", path.display(), err);
+        }
+    }
+}
+
 fn letterbox(window: (u32, u32), stream: (u32, u32)) -> FRect {
     let (ww, wh) = (window.0.max(1) as f32, window.1.max(1) as f32);
     let scale = (ww / stream.0 as f32).min(wh / stream.1 as f32);
@@ -306,7 +326,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     // 6. Event and presentation loop.
-    info!("Move the pointer to the top edge of the window for the toolbar");
+    info!("Move the pointer to the top edge of the window for the menu");
     info!("Ctrl+Alt+G: grab keyboard | Ctrl+Alt+L: lock mouse | Ctrl+Alt+M: relative mouse | Ctrl+Alt+F: fullscreen | Ctrl+Alt+Q: quit");
     let mut event_pump = sdl.event_pump()?;
     let started = Instant::now();
@@ -324,7 +344,7 @@ fn main() -> anyhow::Result<()> {
     if mouse_lock {
         canvas.window_mut().set_mouse_grab(true);
     }
-    let mut toolbar = toolbar::Toolbar::new();
+    let mut toolbar = toolbar::Toolbar::new(load_toolbar_position());
     let mut pointer: Option<(f32, f32)> = None;
     // A press that landed on the toolbar; its release must not reach the remote desktop either.
     let mut toolbar_press = false;
@@ -354,16 +374,22 @@ fn main() -> anyhow::Result<()> {
                 Event::Window { win_event: WindowEvent::MouseLeave, .. } => pointer = None,
                 _ => {}
             }
+            // The release of a press the menu took is the menu's too, even if that press switched
+            // to relative mode.
+            if toolbar_press && matches!(event, Event::MouseButtonUp { .. }) {
+                toolbar_press = false;
+                if toolbar.release() {
+                    save_toolbar_position(toolbar.position());
+                }
+                redraw = true;
+                continue;
+            }
             if !relative_mouse {
                 match &event {
-                    Event::MouseMotion { x, y, .. } if toolbar.captures((*x, *y), window_width, &stats) => continue,
+                    Event::MouseMotion { x, y, .. } if toolbar.captures_motion((*x, *y), window_width, &stats) => continue,
                     Event::MouseButtonDown { x, y, .. } if toolbar.captures((*x, *y), window_width, &stats) => {
                         toolbar_press = true;
-                        action = toolbar.click((*x, *y), window_width, &stats);
-                    }
-                    Event::MouseButtonUp { .. } if toolbar_press => {
-                        toolbar_press = false;
-                        continue;
+                        action = toolbar.press((*x, *y), window_width, &stats);
                     }
                     Event::MouseWheel { .. } if pointer.is_some_and(|p| toolbar.captures(p, window_width, &stats)) => continue,
                     _ => {}
@@ -382,6 +408,13 @@ fn main() -> anyhow::Result<()> {
                     Some(toolbar::Action::MouseLock) => {
                         mouse_lock = !mouse_lock;
                         canvas.window_mut().set_mouse_grab(mouse_lock);
+                    }
+                    Some(toolbar::Action::RelativeMouse) => {
+                        // The pointer is gone from here on, and the menu with it.
+                        relative_mouse = true;
+                        sdl.mouse().set_relative_mouse_mode(canvas.window(), true);
+                        toolbar.notify("Relative mouse on - Ctrl+Alt+M to turn off");
+                        info!("Relative mouse: true");
                     }
                     Some(toolbar::Action::Mute) => muted = !muted,
                     Some(toolbar::Action::Disconnect) => break 'main,
@@ -411,7 +444,9 @@ fn main() -> anyhow::Result<()> {
                         Keycode::M => {
                             relative_mouse = !relative_mouse;
                             sdl.mouse().set_relative_mouse_mode(canvas.window(), relative_mouse);
+                            toolbar.notify(if relative_mouse { "Relative mouse on - Ctrl+Alt+M to turn off" } else { "Relative mouse off" });
                             info!("Relative mouse: {}", relative_mouse);
+                            redraw = true;
                         }
                         Keycode::F => {
                             fullscreen = !fullscreen;
@@ -511,6 +546,7 @@ fn main() -> anyhow::Result<()> {
                 toolbar::Action::Fullscreen => fullscreen,
                 toolbar::Action::KeyboardGrab => grab,
                 toolbar::Action::MouseLock => mouse_lock,
+                toolbar::Action::RelativeMouse => relative_mouse,
                 toolbar::Action::Mute => muted,
                 toolbar::Action::Disconnect => false,
             });

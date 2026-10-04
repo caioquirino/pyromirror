@@ -86,7 +86,7 @@ To stop, close the window or use **Disconnect**. On the shared computer, **Stop 
 
 ## While connected
 
-Move the pointer to the top edge of the remote desktop window for the toolbar: fullscreen, keyboard grab, mouse lock, mute, disconnect, and the live frame rate and bitrate.
+Move the pointer to the top edge of the remote desktop window and a small handle appears. Click it for the session menu: fullscreen, keyboard grab, mouse lock, relative mouse, mute, disconnect, and the live frame rate and bitrate. If the handle sits where you need the edge (scrolling the map in a strategy game, say), drag it sideways; it stays where you leave it, in later sessions too.
 
 | Keys | Action |
 | :--- | :--- |
