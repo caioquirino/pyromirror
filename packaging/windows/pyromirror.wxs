@@ -9,7 +9,7 @@
   <Product Id="*" Name="PyroMirror" Language="1033" Version="$(var.Version)"
            Manufacturer="PyroMirror contributors"
            UpgradeCode="8c0f1b9e-6b0a-4a55-9a3e-2f6f3c1d7a41">
-    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine" Platform="x64"
+    <Package InstallerVersion="500" Compressed="yes" InstallScope="perMachine"
              Description="PyroMirror $(var.Version)"
              Comments="Low-latency remote desktop for local networks" />
     <MajorUpgrade DowngradeErrorMessage="A newer version of PyroMirror is already installed." />

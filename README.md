@@ -179,6 +179,24 @@ Ready-to-use scripts are located in `scripts/`:
 
 ---
 
+## Installing a Release
+
+Each [release](https://github.com/caioquirino/pyromirror/releases) carries ready-made packages:
+
+| System | File | Install with |
+| :--- | :--- | :--- |
+| Windows | `pyromirror-<version>-windows-x86_64.msi` | Double-click; adds a Start menu entry |
+| Windows (portable) | `pyromirror-<version>-windows-x86_64.zip` | Unzip anywhere, run `pyromirror.exe` |
+| Debian / Ubuntu 24.04+ | `pyromirror_<version>-1_amd64.deb` | `sudo apt install ./pyromirror_*.deb` |
+| Fedora 40+ | `pyromirror-<version>-1.x86_64.rpm` | `sudo dnf install ./pyromirror-*.rpm` |
+| Arch Linux | `pyromirror-<version>-1-x86_64.pkg.tar.zst` | `sudo pacman -U pyromirror-*.pkg.tar.zst` |
+| Arch Linux (AUR) | `PKGBUILD` (`pyromirror-bin`) | `makepkg -si` next to the file |
+| Other Linux | `pyromirror-<version>-linux-x86_64.tar.gz` | Unpack, run `./pyromirror` |
+
+The Linux packages need PipeWire, a Vulkan driver and, on the host, `xdg-desktop-portal` for your desktop. Windows builds are not code-signed yet, so Windows may warn about or block them (see Code Signing Policy).
+
+---
+
 ## Running PyroMirror
 
 The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) on both computers, press **Share this computer** on the host, and enter the address it shows in the **Connect** tab on the other one. It looks and works the same on Windows and Linux. The command-line programs it drives are described below.
