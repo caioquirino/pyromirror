@@ -5,12 +5,17 @@
 // Each changed desktop image is copied into a CPU-readable staging texture and handed out as a
 // mapped BGRA pointer. In GPU mode it is instead copied into a shared texture that the encoder
 // reads directly through Vulkan, which skips the readback (the expensive part at 4K).
+//
+// A monitor in HDR mode is duplicated as linear scRGB floats and converted to SDR by a small
+// shader here, with the SDR brightness the user chose in Windows as white. (The plain
+// duplication API hands out Windows' own conversion instead, which looks washed out.)
 
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <dxgi1_6.h>
 #include <d3d11.h>
 #include <d3d11_4.h>
+#include <d3dcompiler.h>
 #include <wrl/client.h>
 #include <stdio.h>
 #include <string.h>
@@ -44,6 +49,19 @@ struct pyromirror_capture_context {
     ComPtr<ID3D11Fence> fence;
     uint64_t fence_value = 0;
     ComPtr<ID3D11Query> copy_done;
+
+    // HDR desktops: scRGB in, SDR out, into `shared`.
+    bool hdr_failed = false; // Fall back to the duplication API that converts by itself.
+    bool hdr_frames = false; // The last frame came as scRGB.
+    ComPtr<ID3D11VertexShader> hdr_vs;
+    ComPtr<ID3D11PixelShader> hdr_ps;
+    ComPtr<ID3D11Buffer> hdr_constants;
+    ComPtr<ID3D11Texture2D> hdr_source;
+    ComPtr<ID3D11ShaderResourceView> hdr_source_view;
+    ComPtr<ID3D11RenderTargetView> shared_target;
+    uint64_t shared_target_id = 0;
+    float sdr_white_nits = 0.0f;
+    uint32_t frames_since_white_check = 0;
 
     // Desktop Duplication never draws the pointer into the image; it reports it on the side.
     uint64_t cursor_serial = 0;
@@ -298,8 +316,167 @@ static void wait_for_gpu(pyromirror_capture_context* ctx) {
     ctx->context->Flush();
 }
 
+// How bright Windows shows SDR white on this monitor while it is in HDR mode (the "SDR content
+// brightness" slider), in nits.
+static float query_sdr_white_nits(pyromirror_capture_context* ctx) {
+    const float fallback = 240.0f; // The slider's usual default.
+    DXGI_OUTPUT_DESC output_desc = {};
+    if (FAILED(ctx->output->GetDesc(&output_desc))) return fallback;
+
+    UINT32 path_count = 0, mode_count = 0;
+    if (GetDisplayConfigBufferSizes(QDC_ONLY_ACTIVE_PATHS, &path_count, &mode_count) != ERROR_SUCCESS) return fallback;
+    std::vector<DISPLAYCONFIG_PATH_INFO> paths(path_count);
+    std::vector<DISPLAYCONFIG_MODE_INFO> modes(mode_count);
+    if (QueryDisplayConfig(QDC_ONLY_ACTIVE_PATHS, &path_count, paths.data(), &mode_count, modes.data(), nullptr) != ERROR_SUCCESS) {
+        return fallback;
+    }
+    for (UINT32 i = 0; i < path_count; ++i) {
+        DISPLAYCONFIG_SOURCE_DEVICE_NAME source = {};
+        source.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SOURCE_NAME;
+        source.header.size = sizeof(source);
+        source.header.adapterId = paths[i].sourceInfo.adapterId;
+        source.header.id = paths[i].sourceInfo.id;
+        if (DisplayConfigGetDeviceInfo(&source.header) != ERROR_SUCCESS ||
+            wcscmp(source.viewGdiDeviceName, output_desc.DeviceName) != 0) {
+            continue;
+        }
+        DISPLAYCONFIG_SDR_WHITE_LEVEL white = {};
+        white.header.type = DISPLAYCONFIG_DEVICE_INFO_GET_SDR_WHITE_LEVEL;
+        white.header.size = sizeof(white);
+        white.header.adapterId = paths[i].targetInfo.adapterId;
+        white.header.id = paths[i].targetInfo.id;
+        if (DisplayConfigGetDeviceInfo(&white.header) == ERROR_SUCCESS && white.SDRWhiteLevel > 0) {
+            // 1000 stands for 80 nits.
+            return static_cast<float>(white.SDRWhiteLevel) * 80.0f / 1000.0f;
+        }
+    }
+    return fallback;
+}
+
+static const char HDR_SHADER[] = R"(
+Texture2D<float4> source : register(t0);
+cbuffer Constants : register(b0) { float gain; float3 unused; };
+
+float4 vs(uint id : SV_VertexID) : SV_Position {
+    float2 p = float2((id << 1) & 2, id & 2);
+    return float4(p * float2(2, -2) + float2(-1, 1), 0, 1);
+}
+
+float3 srgb(float3 c) {
+    float3 low = c * 12.92;
+    float3 high = 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+    return lerp(high, low, step(c, 0.0031308));
+}
+
+// scRGB is linear with 1.0 at 80 nits. `gain` brings SDR white to 1.0; what is brighter than
+// that (HDR highlights) or outside sRGB's colours is clipped.
+float4 ps(float4 position : SV_Position) : SV_Target {
+    float3 c = saturate(source.Load(int3(position.xy, 0)).rgb * gain);
+    return float4(srgb(c), 1);
+}
+)";
+
+static bool ensure_hdr_pipeline(pyromirror_capture_context* ctx) {
+    if (ctx->hdr_ps) return true;
+    ComPtr<ID3DBlob> vs, ps;
+    if (FAILED(D3DCompile(HDR_SHADER, sizeof(HDR_SHADER) - 1, nullptr, nullptr, nullptr, "vs", "vs_5_0", 0, 0, &vs, nullptr)) ||
+        FAILED(D3DCompile(HDR_SHADER, sizeof(HDR_SHADER) - 1, nullptr, nullptr, nullptr, "ps", "ps_5_0", 0, 0, &ps, nullptr))) {
+        return false;
+    }
+    D3D11_BUFFER_DESC constants = {};
+    constants.ByteWidth = 16;
+    constants.Usage = D3D11_USAGE_DEFAULT;
+    constants.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+    ComPtr<ID3D11PixelShader> pixel_shader;
+    if (FAILED(ctx->device->CreateVertexShader(vs->GetBufferPointer(), vs->GetBufferSize(), nullptr, &ctx->hdr_vs)) ||
+        FAILED(ctx->device->CreatePixelShader(ps->GetBufferPointer(), ps->GetBufferSize(), nullptr, &pixel_shader)) ||
+        FAILED(ctx->device->CreateBuffer(&constants, nullptr, &ctx->hdr_constants))) {
+        return false;
+    }
+    ctx->hdr_ps = pixel_shader;
+    return true;
+}
+
+static bool ensure_shared(pyromirror_capture_context* ctx, const D3D11_TEXTURE2D_DESC& desc);
+
+// Converts an scRGB desktop image to SDR, into the shared texture.
+static bool convert_hdr(pyromirror_capture_context* ctx, ID3D11Texture2D* frame) {
+    D3D11_TEXTURE2D_DESC desc = {};
+    frame->GetDesc(&desc);
+    if (!ensure_hdr_pipeline(ctx)) return false;
+
+    D3D11_TEXTURE2D_DESC sdr_desc = desc;
+    sdr_desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
+    if (!ensure_shared(ctx, sdr_desc)) return false;
+    if (!ctx->shared_target || ctx->shared_target_id != ctx->shared_id) {
+        ctx->shared_target.Reset();
+        if (FAILED(ctx->device->CreateRenderTargetView(ctx->shared.Get(), nullptr, &ctx->shared_target))) return false;
+        ctx->shared_target_id = ctx->shared_id;
+    }
+
+    // The duplicated image cannot be relied on to be bindable to a shader; a copy of ours can.
+    D3D11_TEXTURE2D_DESC source_desc = {};
+    if (ctx->hdr_source) ctx->hdr_source->GetDesc(&source_desc);
+    if (!ctx->hdr_source || source_desc.Width != desc.Width || source_desc.Height != desc.Height || source_desc.Format != desc.Format) {
+        source_desc = {};
+        source_desc.Width = desc.Width;
+        source_desc.Height = desc.Height;
+        source_desc.MipLevels = 1;
+        source_desc.ArraySize = 1;
+        source_desc.Format = desc.Format;
+        source_desc.SampleDesc.Count = 1;
+        source_desc.Usage = D3D11_USAGE_DEFAULT;
+        source_desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+        ctx->hdr_source.Reset();
+        ctx->hdr_source_view.Reset();
+        if (FAILED(ctx->device->CreateTexture2D(&source_desc, nullptr, &ctx->hdr_source)) ||
+            FAILED(ctx->device->CreateShaderResourceView(ctx->hdr_source.Get(), nullptr, &ctx->hdr_source_view))) {
+            ctx->hdr_source.Reset();
+            return false;
+        }
+    }
+    ctx->context->CopyResource(ctx->hdr_source.Get(), frame);
+
+    // The slider can be moved at any time; look now and then.
+    if (ctx->sdr_white_nits <= 0.0f || ++ctx->frames_since_white_check >= 120) {
+        ctx->sdr_white_nits = query_sdr_white_nits(ctx);
+        ctx->frames_since_white_check = 0;
+    }
+    const float constants[4] = { 80.0f / ctx->sdr_white_nits, 0.0f, 0.0f, 0.0f };
+    ctx->context->UpdateSubresource(ctx->hdr_constants.Get(), 0, nullptr, constants, 0, 0);
+
+    D3D11_VIEWPORT viewport = { 0.0f, 0.0f, static_cast<float>(desc.Width), static_cast<float>(desc.Height), 0.0f, 1.0f };
+    ID3D11RenderTargetView* target = ctx->shared_target.Get();
+    ID3D11ShaderResourceView* view = ctx->hdr_source_view.Get();
+    ID3D11Buffer* buffer = ctx->hdr_constants.Get();
+    auto* c = ctx->context.Get();
+    c->OMSetRenderTargets(1, &target, nullptr);
+    c->RSSetViewports(1, &viewport);
+    c->IASetInputLayout(nullptr);
+    c->IASetPrimitiveTopology(D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST);
+    c->VSSetShader(ctx->hdr_vs.Get(), nullptr, 0);
+    c->PSSetShader(ctx->hdr_ps.Get(), nullptr, 0);
+    c->PSSetShaderResources(0, 1, &view);
+    c->PSSetConstantBuffers(0, 1, &buffer);
+    c->Draw(3, 0);
+    // Leave nothing bound: both textures are used elsewhere right after.
+    ID3D11ShaderResourceView* no_view = nullptr;
+    c->PSSetShaderResources(0, 1, &no_view);
+    c->OMSetRenderTargets(0, nullptr, nullptr);
+    return true;
+}
+
 static HRESULT duplicate(pyromirror_capture_context* ctx) {
     ctx->duplication.Reset();
+    // The newer call can hand out an HDR desktop as it is (scRGB), which convert_hdr turns into a
+    // proper SDR picture. It behaves like the old one on SDR monitors.
+    ComPtr<IDXGIOutput5> output5;
+    if (!ctx->hdr_failed && SUCCEEDED(ctx->output.As(&output5))) {
+        const DXGI_FORMAT formats[] = { DXGI_FORMAT_R16G16B16A16_FLOAT, DXGI_FORMAT_B8G8R8A8_UNORM };
+        HRESULT hr = output5->DuplicateOutput1(ctx->device.Get(), 0, 2, formats, &ctx->duplication);
+        if (SUCCEEDED(hr)) return hr;
+        ctx->duplication.Reset();
+    }
     return ctx->output->DuplicateOutput(ctx->device.Get(), &ctx->duplication);
 }
 
@@ -422,6 +599,38 @@ extern "C" int pyromirror_capture_acquire(pyromirror_capture_context* ctx, uint3
     if (info.LastPresentTime.QuadPart == 0 || FAILED(resource.As(&tex))) {
         ctx->duplication->ReleaseFrame();
         return PYROMIRROR_CAPTURE_NO_FRAME;
+    }
+
+    D3D11_TEXTURE2D_DESC frame_desc = {};
+    tex->GetDesc(&frame_desc);
+    ctx->hdr_frames = frame_desc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+    if (ctx->hdr_frames) {
+        bool converted = convert_hdr(ctx, tex.Get());
+        tex.Reset();
+        resource.Reset();
+        ctx->duplication->ReleaseFrame();
+        if (!converted) {
+            // Use the duplication call that converts by itself from now on.
+            ctx->hdr_failed = true;
+            ctx->hdr_frames = false;
+            ctx->duplication.Reset();
+            return PYROMIRROR_CAPTURE_NO_FRAME;
+        }
+        if (ctx->gpu) {
+            wait_for_gpu(ctx);
+            out_frame->data = nullptr;
+            out_frame->width = frame_desc.Width;
+            out_frame->height = frame_desc.Height;
+            out_frame->stride = 0;
+            out_frame->format = PYROMIRROR_CAPTURE_FORMAT_BGRX;
+            out_frame->gpu_texture = ctx->shared_id;
+            out_frame->prepare_us = prepare_us();
+            return PYROMIRROR_CAPTURE_FRAME;
+        }
+        if (!copy_to_staging(ctx, ctx->shared.Get())) return PYROMIRROR_CAPTURE_ERROR;
+        int result = map_staging(ctx, out_frame);
+        out_frame->prepare_us = prepare_us();
+        return result;
     }
 
     if (ctx->gpu) {

@@ -190,9 +190,9 @@ impl Capturer {
         let _ = &mut config;
 
         if unsafe { pyromirror_capture_hdr_active(ctx) } {
-            log::warn!(
-                "The captured monitor is in HDR mode. HDR capture is not implemented yet, so Windows \
-                 hands out an SDR conversion that looks washed out; turn HDR off for correct colours."
+            log::info!(
+                "The captured monitor is in HDR mode; the picture is converted to SDR, with highlights \
+                 brighter than SDR white clipped"
             );
         }
 

@@ -25,6 +25,8 @@ fn main() {
             }
             println!("cargo:rustc-link-lib=d3d11");
             println!("cargo:rustc-link-lib=dxgi");
+            // Compiles the HDR conversion shader at run time; part of Windows since 8.1.
+            println!("cargo:rustc-link-lib=d3dcompiler_47");
         }
         "linux" => {
             // Also emits the link flags.
