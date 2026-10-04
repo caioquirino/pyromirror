@@ -4,6 +4,8 @@
 
 PyroMirror is designed from the ground up for **local Ethernet (1GbE / 2.5GbE / 10GbE)** and **USB4 / Thunderbolt 4 point-to-point networks (20–40 Gbps)**. By pairing Hans-Kristian Arntzen's Vulkan compute wavelet codec (PyroWave) with a zero-copy capture pipeline, PyroMirror achieves **sub-millisecond encode/decode latency**, pristine **4:4:4 color**, and zero reference-frame packet drop stalls.
 
+**Website:** <https://caioquirino.github.io/pyromirror/>
+
 For deep technical architecture, performance targets, and design specifications, see [PRODUCT.md](PRODUCT.md).
 
 ---
