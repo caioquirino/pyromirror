@@ -33,6 +33,7 @@
   h1 { font-size: 46px; line-height: 1.12; margin: 0 0 18px; letter-spacing: -0.5px; }
   h1 em { font-style: normal; color: var(--accent); }
   .lead { font-size: 19px; color: var(--muted); margin: 0 0 28px; max-width: 34em; }
+  .hero-icon { width: 96px; height: 96px; margin-bottom: 14px; }
   .badge {
     display: inline-block; font-size: 13px; padding: 3px 10px; border-radius: 999px; margin-bottom: 18px;
     border: 1px solid var(--yellow); color: var(--yellow);
@@ -107,6 +108,8 @@
 
   <div class="hero">
     <div>
+      <img class="hero-icon" src="assets/icon.png" width="96" height="96" alt="PyroMirror icon">
+      <br>
       <span class="badge">Beta</span>
       <h1>Remote desktop for your <em>local network</em>, built for low latency.</h1>
       <p class="lead">PyroMirror streams a desktop between two computers over Ethernet using the PyroWave GPU codec: every frame stands alone, so a lost packet costs a blurry patch instead of a stalled picture.</p>

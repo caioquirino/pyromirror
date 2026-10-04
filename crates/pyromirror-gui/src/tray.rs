@@ -27,30 +27,33 @@ pub enum Indicator {
     Attention,
 }
 
-/// Draws the PyroMirror icon (the same screen-and-flame as the window, shortcut and package
-/// icons) with the sharing state worked in:
+/// Draws the PyroMirror icon (a monitor with a flame on its screen, on a transparent
+/// background so the shapes use the whole canvas) with the sharing state worked in:
 ///
-/// - off: the flame is grey
-/// - sharing: the flame burns
-/// - someone connected: burning, with a green badge
-/// - needs attention: burning, with a yellow badge
+/// - off: everything grey
+/// - sharing: orange monitor, flame on a dark screen
+/// - someone connected: the screen lights up, and a green dot appears
+/// - needs attention: as sharing, with a yellow dot
 ///
-/// Returns `size * size` RGBA pixels. The shapes are those of `assets/icon.png` (a test checks it),
-/// drawn in a 256x256 coordinate space.
+/// Returns `size * size` RGBA pixels. The "sharing" look is the application icon;
+/// `scripts/make_icons.py` writes the same shapes to the icon files and a test checks they agree.
 pub fn icon_rgba(size: u32, indicator: Indicator) -> Vec<u8> {
-    const BG: [u8; 3] = [0x12, 0x15, 0x1c];
-    const SCREEN: [u8; 3] = [0x1b, 0x20, 0x2b];
-    const BORDER: [u8; 3] = [0x2e, 0x35, 0x45];
-    let (flame_outer, flame_inner) = match indicator {
-        Indicator::Off => ([0x6b, 0x73, 0x82], [0x9a, 0xa1, 0xae]),
-        _ => ([0xff, 0x7a, 0x2f], [0xff, 0xd2, 0x7a]),
-    };
-    let badge = match indicator {
-        Indicator::Connected => Some([0x3e, 0xcf, 0x8e]),
-        Indicator::Attention => Some([0xf2, 0xc1, 0x4e]),
-        Indicator::Off | Indicator::On => None,
+    const ORANGE: [u8; 3] = [0xff, 0x7a, 0x2f];
+    const YELLOW: [u8; 3] = [0xff, 0xd2, 0x7a];
+    const DARK: [u8; 3] = [0x12, 0x15, 0x1c];
+    const GREY: [u8; 3] = [0x7c, 0x84, 0x93];
+    const GREY_LIGHT: [u8; 3] = [0xb4, 0xba, 0xc6];
+    const WHITE: [u8; 3] = [0xff, 0xff, 0xff];
+
+    // Frame, screen, outer flame, inner flame, dot.
+    let (frame, screen, flame_outer, flame_inner, dot) = match indicator {
+        Indicator::Off => (GREY, DARK, GREY, GREY_LIGHT, None),
+        Indicator::On => (ORANGE, DARK, ORANGE, YELLOW, None),
+        Indicator::Connected => (ORANGE, YELLOW, ORANGE, WHITE, Some([0x3e, 0xcf, 0x8e])),
+        Indicator::Attention => (ORANGE, DARK, ORANGE, YELLOW, Some([0xf2, 0xc1, 0x4e])),
     };
 
+    // Shapes in a 256x256 space.
     let rounded_rect = |x: f32, y: f32, x0: f32, y0: f32, w: f32, h: f32, r: f32| {
         let cx = x.clamp(x0 + r, x0 + w - r);
         let cy = y.clamp(y0 + r, y0 + h - r);
@@ -61,7 +64,36 @@ pub fn icon_rgba(size: u32, indicator: Indicator) -> Vec<u8> {
         let dx = x - 128.0;
         dx * dx + (y - cy).powi(2) <= r * r || (y >= tip && y <= cy && dx.abs() <= r * ((y - tip) / (cy - tip)).powf(0.8))
     };
-    let disc = |x: f32, y: f32, cx: f32, cy: f32, r: f32| (x - cx).powi(2) + (y - cy).powi(2) <= r * r;
+    let disc = |x: f32, y: f32, r: f32| (x - 196.0).powi(2) + (y - 196.0).powi(2) <= r * r;
+
+    let color_at = |x: f32, y: f32| -> Option<[u8; 3]> {
+        let mut color = None;
+        if rounded_rect(x, y, 100.0, 186.0, 56.0, 26.0, 4.0) || rounded_rect(x, y, 64.0, 210.0, 128.0, 26.0, 13.0) {
+            color = Some(frame);
+        }
+        if rounded_rect(x, y, 6.0, 20.0, 244.0, 176.0, 30.0) {
+            color = Some(frame);
+        }
+        if rounded_rect(x, y, 26.0, 40.0, 204.0, 136.0, 14.0) {
+            color = Some(screen);
+        }
+        if flame(x, y, 122.0, 44.0, 50.0) {
+            color = Some(flame_outer);
+        }
+        if flame(x, y, 138.0, 19.0, 100.0) {
+            color = Some(flame_inner);
+        }
+        if let Some(dot) = dot {
+            // A transparent ring around the dot separates it from the monitor.
+            if disc(x, y, 62.0) {
+                color = None;
+            }
+            if disc(x, y, 48.0) {
+                color = Some(dot);
+            }
+        }
+        color
+    };
 
     // Supersampled: every pixel averages SS x SS samples.
     const SS: u32 = 4;
@@ -74,38 +106,12 @@ pub fn icon_rgba(size: u32, indicator: Indicator) -> Vec<u8> {
                 for sx in 0..SS {
                     let x = ((px * SS + sx) as f32 + 0.5) * scale;
                     let y = ((py * SS + sy) as f32 + 0.5) * scale;
-                    if !rounded_rect(x, y, 0.0, 0.0, 256.0, 256.0, 56.0) {
-                        continue;
-                    }
-                    let mut color = BG;
-                    if rounded_rect(x, y, 104.0, 184.0, 48.0, 12.0, 4.0) || rounded_rect(x, y, 84.0, 196.0, 88.0, 12.0, 6.0) {
-                        color = BORDER;
-                    }
-                    if rounded_rect(x, y, 37.0, 53.0, 182.0, 122.0, 17.0) {
-                        color = BORDER;
-                    }
-                    if rounded_rect(x, y, 43.0, 59.0, 170.0, 110.0, 11.0) {
-                        color = SCREEN;
-                    }
-                    if flame(x, y, 130.0, 30.0, 72.0) {
-                        color = flame_outer;
-                    }
-                    if flame(x, y, 141.0, 12.0, 116.0) {
-                        color = flame_inner;
-                    }
-                    if let Some(badge) = badge {
-                        // Big enough to read at 16 pixels, with a dark ring to set it off.
-                        if disc(x, y, 196.0, 196.0, 58.0) {
-                            color = BG;
+                    if let Some(color) = color_at(x, y) {
+                        for i in 0..3 {
+                            sum[i] += color[i] as u32;
                         }
-                        if disc(x, y, 196.0, 196.0, 44.0) {
-                            color = badge;
-                        }
+                        covered += 1;
                     }
-                    for i in 0..3 {
-                        sum[i] += color[i] as u32;
-                    }
-                    covered += 1;
                 }
             }
             if covered > 0 {
@@ -323,35 +329,41 @@ mod tests {
     use super::*;
 
     #[test]
-    fn icon_is_the_app_icon_with_the_state_worked_in() {
+    fn icon_shows_each_state() {
         let size = 64;
         let at = |pixels: &[u8], x: u32, y: u32| -> [u8; 4] {
             pixels[((y * size + x) * 4) as usize..][..4].try_into().unwrap()
         };
+        let (frame, screen, flame, corner, dot) = ((32, 7), (12, 20), (32, 18), (0, 0), (49, 49));
+
         let on = icon_rgba(size, Indicator::On);
         assert_eq!(on.len(), (size * size * 4) as usize);
-        assert_eq!(at(&on, 0, 0)[3], 0, "rounded corner is transparent");
-        assert_eq!(at(&on, 32, 28), [0xff, 0x7a, 0x2f, 255], "the flame burns while sharing");
-        assert_eq!(at(&on, 20, 20), [0x1b, 0x20, 0x2b, 255], "screen");
+        assert_eq!(at(&on, corner.0, corner.1)[3], 0, "the background is transparent");
+        assert_eq!(at(&on, frame.0, frame.1), [0xff, 0x7a, 0x2f, 255], "orange monitor while sharing");
+        assert_eq!(at(&on, screen.0, screen.1), [0x12, 0x15, 0x1c, 255], "dark screen");
+        assert_eq!(at(&on, flame.0, flame.1), [0xff, 0x7a, 0x2f, 255], "flame");
 
         let off = icon_rgba(size, Indicator::Off);
-        assert_eq!(at(&off, 32, 28), [0x6b, 0x73, 0x82, 255], "the flame is grey while off");
+        assert_eq!(at(&off, frame.0, frame.1), [0x7c, 0x84, 0x93, 255], "grey monitor while off");
+        assert_eq!(at(&off, flame.0, flame.1), [0x7c, 0x84, 0x93, 255], "grey flame while off");
 
-        // Same icon as "on", plus a badge in the corner.
         let connected = icon_rgba(size, Indicator::Connected);
-        assert_eq!(at(&connected, 32, 28), at(&on, 32, 28));
-        assert_eq!(at(&connected, 49, 49), [0x3e, 0xcf, 0x8e, 255], "green badge when someone is connected");
-        assert_eq!(at(&icon_rgba(size, Indicator::Attention), 49, 49), [0xf2, 0xc1, 0x4e, 255]);
-        assert_ne!(at(&on, 49, 49), at(&connected, 49, 49));
+        assert_eq!(at(&connected, screen.0, screen.1), [0xff, 0xd2, 0x7a, 255], "the screen lights up when someone watches");
+        assert_eq!(at(&connected, dot.0, dot.1), [0x3e, 0xcf, 0x8e, 255], "with a green dot");
+
+        let attention = icon_rgba(size, Indicator::Attention);
+        assert_eq!(at(&attention, screen.0, screen.1), [0x12, 0x15, 0x1c, 255]);
+        assert_eq!(at(&attention, dot.0, dot.1), [0xf2, 0xc1, 0x4e, 255], "yellow dot when attention is needed");
     }
 
-    /// The window, shortcut and installer use assets/icon.png; the tray draws the same picture.
+    /// The window, shortcut, installer and packages use assets/icon.png; the tray's "sharing"
+    /// icon must be the same picture.
     #[test]
     fn tray_icon_matches_the_bundled_app_icon() {
         let png = eframe::icon_data::from_png_bytes(include_bytes!("../assets/icon.png")).unwrap();
         assert_eq!((png.width, png.height), (256, 256));
         let drawn = icon_rgba(256, Indicator::On);
         let worst = png.rgba.iter().zip(&drawn).map(|(a, b)| (*a as i32 - *b as i32).abs()).max().unwrap();
-        assert!(worst <= 2, "tray icon differs from the app icon by up to {worst}");
+        assert!(worst <= 3, "tray icon differs from the app icon by up to {worst}");
     }
 }

@@ -1,4 +1,8 @@
-# PyroMirror (🔥🪞)
+<p align="center">
+  <img src="crates/pyromirror-gui/assets/icon.png" alt="PyroMirror icon" width="128" height="128">
+</p>
+
+# PyroMirror
 
 > **Next-generation, ultra-low-latency, high-bandwidth remote desktop and display streaming system built with [PyroWave](https://github.com/Themaister/pyrowave) and Rust.**
 
@@ -207,7 +211,7 @@ The easiest way is the launcher: run `pyromirror` (`pyromirror.exe` on Windows) 
 
 In **Settings → General**:
 
-* **Start PyroMirror in the tray when I log in** adds a login entry (the `Run` registry key on Windows, an XDG autostart file on Linux) and puts an icon in the tray. It is the PyroMirror icon with the state worked in: a grey flame while sharing is off, a burning one while it is on, a green badge while someone is connected, a yellow badge when something needs you. Its menu can start or stop sharing, open the window, or quit. A notification appears when someone connects, disconnects or asks to pair. With the icon running, closing the window no longer stops sharing.
+* **Start PyroMirror in the tray when I log in** adds a login entry (the `Run` registry key on Windows, an XDG autostart file on Linux) and puts an icon in the tray. It is the PyroMirror icon with the state worked in: all grey while sharing is off, orange while it is on, a lit screen with a green dot while someone is connected, and a yellow dot when something needs you. Its menu can start or stop sharing, open the window, or quit. A notification appears when someone connects, disconnects or asks to pair. With the icon running, closing the window no longer stops sharing.
 * **Start sharing automatically at login** makes the computer reachable without anyone at the desk. Switching it on first runs a permission check (`pyromirror-server --check-permissions`): it starts screen capture so your desktop asks for consent now, verifies the consent is remembered, and on Windows waits for the firewall to allow incoming connections. The setting only turns on if the check passes.
 
 GNOME shows tray icons only with the AppIndicator extension; without it everything else still works and the window is opened from the application menu. Nothing runs before you log in, and on Windows the picture pauses on the lock screen and on UAC prompts.
