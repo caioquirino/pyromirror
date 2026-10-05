@@ -86,11 +86,13 @@ To stop, close the window or use **Disconnect**. On the shared computer, **Stop 
 
 ## While connected
 
-Move the pointer to the top edge of the remote desktop window and a small handle appears. Click it for the session menu: fullscreen, keyboard grab, mouse lock, relative mouse, mute, disconnect, and the live frame rate and bitrate. If the handle sits where you need the edge (scrolling the map in a strategy game, say), drag it sideways; it stays where you leave it, in later sessions too.
+Move the pointer to the top edge of the remote desktop window and a small handle appears. Click it for the session menu: fullscreen, keyboard grab, mouse lock, relative mouse, mute, disconnect, and the live frame rate, bitrate and packet size (`pkt`, the largest packet that arrived). If the handle sits where you need the edge (scrolling the map in a strategy game, say), drag it sideways; it stays where you leave it, in later sessions too.
 
 While PyroMirror's tray icon is running, its right-click menu has the same options under "*name* session" for as long as you are connected. The tray icon on the remote computer has that menu too, so the options stay within reach through the session itself, whatever state the window on your side is in.
 
 Relative mouse (for games that steer with the mouse) takes the pointer away, and the menu with it. A small note at the top edge shows the way out, `Ctrl + Alt + M`, for as long as it is on; the tray menu works too.
+
+If the menu says `no picture: packets lost`, video is arriving but no frame gets through whole. The usual cause is a packet size the network cannot carry; the sharing computer is told and switches to smaller packets within a few seconds (see [Network tuning](#network-tuning)).
 
 | Keys | Action |
 | :--- | :--- |
@@ -114,10 +116,11 @@ Settings are grouped by what they affect.
 - **What the other computer gets:** this computer's sound, and control of the mouse and keyboard.
 - **Who may connect:** whether new computers have to pair.
 - **Network:** port, packet size (jumbo packets need a network set up for them) and pacing.
+- **Capture:** whether frames stay on the graphics card, and on Windows whether sharing runs ahead of games and other programs. That keeps the stream smooth while a game has the computer busy; turn it off if the game itself slows down while you share.
 
 These are locked while sharing is on.
 
-**Client Options** apply when you control another computer: start in fullscreen, keep the mouse inside the window, play the other computer's sound.
+**Client Options** apply when you control another computer: start in fullscreen, keep the mouse inside the window, play the other computer's sound, and whether frames stay on the graphics card.
 
 **General** covers starting with the system (next section).
 
@@ -186,14 +189,16 @@ pyromirror-server --bitrate-mbps 250 --fps 60
 | `--bind <ADDR>` | Address to listen on (default `0.0.0.0`) |
 | `--port <PORT>` | Port for TCP control and UDP video (default `9000`) |
 | `--bitrate-mbps <MBPS>` | Video bitrate; each frame is capped to bitrate / fps (default `250`) |
-| `--fps <FPS>` | Maximum frame rate (default `60`) |
+| `--fps <FPS>` | Frame rate to aim for (default `60`). Frames are sent as the desktop draws them; a desktop that refreshes faster than this is held back to it |
 | `--chroma <444\|420>` | Chroma subsampling (default `444`) |
 | `--scale <N>` | Shrink the picture by an integer factor before encoding (default `1`; `2` turns 4K into 1080p) |
-| `--mtu <BYTES>` | UDP datagram size (default `1400`; `8900` for jumbo frames) |
+| `--mtu <BYTES>` | UDP datagram size (default `1400`; `8900` for jumbo frames). Steps down to `1900`, then `1400`, when the client reports that no frame arrives whole |
 | `--pace-factor <X>` | Release packets at X times the bitrate (default `2`; lower, down to `1.1`, is smoother on Wi-Fi) |
 | `--no-pairing` | Let anyone who can reach the port connect |
 | `--no-audio` | Do not capture or send audio |
 | `--no-input` | Ignore the client's mouse and keyboard |
+| `--no-zero-copy` | Copy captured frames through memory instead of encoding them on the graphics card |
+| `--no-priority` | Windows: stay at normal processor and graphics priority instead of running ahead of games |
 | `--monitor <INDEX>` | Windows: monitor to capture (default: primary). On Linux the portal dialog picks it |
 | `--check-permissions` | Check that sharing could start unattended, asking for any permission now, then exit |
 | `--test-pattern <WxH>` | Stream a generated pattern instead of the desktop, to test codec and network |
@@ -216,12 +221,13 @@ The address is `<host>[:<port>]`, optionally with a `pyro://` prefix; the port d
 | `--fullscreen`, `-f` | Start in fullscreen |
 | `--lock-mouse` | Keep the pointer inside the window |
 | `--no-audio` | Do not play the host's sound |
+| `--no-zero-copy` | Read decoded frames back from the graphics card instead of showing them from it |
 | `--local-port <PORT>` | UDP port to receive video on (default: chosen by the system) |
 | `--force-fragment` | Decode with fragment shaders, for weak integrated GPUs |
 
 ### Other
 
-- `pyromirror --background` runs the tray icon without a window; this is what the login entry starts.
+- `pyromirror --background` runs the tray icon without a window; this is what the login entry starts. `pyromirror --help` and `--version` print and exit.
 - Set `RUST_LOG=debug` on either program for frame rate, bitrate and timing statistics every two seconds.
 - Settings and pairings are stored in `%APPDATA%\pyromirror` on Windows and `~/.config/pyromirror` on Linux: `settings.json`, `paired-clients` (computers allowed to connect) and `paired-hosts` (computers you can control). The Linux desktop's remembered permission is in `~/.local/state/pyromirror`.
 
@@ -234,7 +240,7 @@ sudo sysctl -w net.core.rmem_max=33554432
 sudo sysctl -w net.core.wmem_max=33554432
 ```
 
-On a direct link that supports it (Thunderbolt / USB4 networking, or switches with jumbo frames enabled), set the MTU to 9000 on both ends and use `--mtu 8900`.
+On a direct link that supports it (Thunderbolt / USB4 networking, or switches with jumbo frames enabled), set the MTU to 9000 on both ends and use `--mtu 8900`. Every device on the way has to carry packets that big. Wi-Fi cannot (its limit is about 2300 bytes), so over Wi-Fi the stream falls back to 1900-byte packets after a few seconds without a picture; both computers need version 0.1.0-beta.9 or later for that.
 
 ## Building from source
 

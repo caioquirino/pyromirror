@@ -129,7 +129,7 @@
       <div class="card"><h3>Mouse, keyboard and sound</h3><p>Control the remote computer and hear what it plays. Keys are sent as physical keys, so the remote keyboard layout applies.</p></div>
       <div class="card"><h3>Pairing</h3><p>The first time a computer connects, the host shows a one-time code to type on it. After that the two remember each other.</p></div>
       <div class="card"><h3>One launcher</h3><p>Pick "Control another computer" or "Share this computer", press the button. It always shows whether sharing is on.</p></div>
-      <div class="card"><h3>Session menu</h3><p>Fullscreen, keyboard grab, mouse lock, relative mouse for games, mute and disconnect, plus live frame rate and bitrate, behind a small handle at the top edge that you can drag out of the way.</p></div>
+      <div class="card"><h3>Session menu</h3><p>Fullscreen, keyboard grab, mouse lock, relative mouse for games, mute and disconnect, plus live frame rate, bitrate and packet size, behind a small handle at the top edge that you can drag out of the way.</p></div>
       <div class="card"><h3>Works with your desktop</h3><p>Desktop Duplication on Windows; the desktop portal and PipeWire on Linux, for GNOME and KDE on Wayland.</p></div>
     </div>
   </section>
@@ -184,7 +184,8 @@
         <h3>Not there yet</h3>
         <ul class="plain">
           <li><strong>No encryption.</strong> Pairing controls who can connect, but the stream is readable on the network. Use it on networks you trust.</li>
-          <li><strong>No HDR output</strong> (an HDR desktop is sent as SDR), and on Linux frames still take a detour through memory.</li>
+          <li><strong>No HDR output</strong> (an HDR desktop is sent as SDR).</li>
+          <li><strong>The direct GPU path on Linux</strong> is only tried on AMD graphics with KDE on Wayland. Elsewhere frames may take a detour through memory, which costs a few milliseconds.</li>
           <li><strong>No clipboard or file transfer</strong>, and no Android client.</li>
         </ul>
       </div>
